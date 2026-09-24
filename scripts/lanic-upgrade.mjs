@@ -192,8 +192,27 @@ for (const signal of ["SIGTERM", "SIGKILL"]) {
   } catch {}
   await new Promise((r) => setTimeout(r, 1_000));
 }
+// kill 后 builder 的子进程可能仍在向 .app 内写入（asar repack/unpacked 落盘），
+// 立即签名会盖住半成品然后 verify 报 sealed resource invalid。等进程退净再签。
+for (let i = 0; i < 15; i += 1) {
+  try {
+    execFileSync("pgrep", ["-f", "electron-builder"], { stdio: "ignore" });
+    await new Promise((r) => setTimeout(r, 1_000));
+  } catch {
+    break; // pgrep 无匹配退出码 1 = 已退净
+  }
+}
+await new Promise((r) => setTimeout(r, 3_000));
 run(`codesign --force --deep --sign - '${appPath}'`);
-run(`codesign --verify --deep '${appPath}'`);
+try {
+  run(`codesign --verify --deep '${appPath}'`);
+} catch {
+  // 兜底一轮：清理残留进程后重签再验。
+  run("pkill -9 -f electron-builder || true");
+  await new Promise((r) => setTimeout(r, 3_000));
+  run(`codesign --force --deep --sign - '${appPath}'`);
+  run(`codesign --verify --deep '${appPath}'`);
+}
 
 // ── 6. 安装 ────────────────────────────────────────────────────────────────
 
