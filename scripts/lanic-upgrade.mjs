@@ -264,6 +264,18 @@ if (FLAGS.installApp) {
   run(`ditto '${appPath}' '/Applications/${APP_NAME}.app'`);
   run(`codesign --verify --deep '/Applications/${APP_NAME}.app'`);
   run(`open '/Applications/${APP_NAME}.app'`);
+  // 启动冒烟：codesign 深验过不了「收割竞态残包」这一关（签名能盖住半成品，
+  // 应用却在数秒内 exit 0 静默退）。装完必须实证主进程 15s 存活。
+  await new Promise((r) => setTimeout(r, 12_000));
+  try {
+    execFileSync("pgrep", ["-x", APP_NAME], { stdio: "ignore" });
+    console.log(`[lanic-upgrade] 启动冒烟通过：${APP_NAME} 主进程存活`);
+  } catch {
+    fail(
+      `启动冒烟失败：${APP_NAME} 装后 12s 内退出。产物疑似收割竞态残包，` +
+        `回退手段=重跑本脚本（构建瞬态损坏，实测重现率低）；dist 产物在 ${appPath}`,
+    );
+  }
 }
 
 // ── 7. push + T3 ───────────────────────────────────────────────────────────
