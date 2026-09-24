@@ -127,8 +127,10 @@ if (FLAGS.bump) {
 // ── 3. 构建 ────────────────────────────────────────────────────────────────
 
 step("构建桌面（production 后端；remote-assets 是远端 agent 资产，桌面包不需要）");
+// ZCODE_PRODUCT_FLAVOR 在构建期烤进 out/（tsup/vite define），必须与打包身份一致：
+// prod-flavor 代码装进 Preview 壳会在启动期身份错配静默退出（装后冒烟抓过实案）。
 run(
-  "ZCODE_ENV=production ZCODE_SKIP_REMOTE_ASSETS=1 pnpm --filter @zcode/desktop build",
+  `ZCODE_ENV=production ${previewIdentity ? "ZCODE_PREVIEW_IDENTITY=1 " : ""}ZCODE_SKIP_REMOTE_ASSETS=1 pnpm --filter @zcode/desktop build`,
   repoRoot,
 );
 
