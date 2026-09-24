@@ -37,6 +37,13 @@ export const ZCODE_PRODUCT_FLAVOR = normalizeZCodeProductFlavor(
   typeof __ZCODE_PRODUCT_FLAVOR__ !== "undefined" ? __ZCODE_PRODUCT_FLAVOR__ : undefined,
   ZCODE_ENV,
 );
+
+/**
+ * Fork 决策（LanicBlue/ZCode）：自编译版本永久关闭整条更新链路——无后台轮询、
+ * 无手动检查入口、不参与远端强制升级 gate。版本推进 = git 合并上游后重新构建安装，
+ * 因此保留 production 身份（应用名/数据目录与官方版互换），只摘掉更新行为本身。
+ */
+export const ZCODE_FORK_DISABLE_UPDATES: boolean = true;
 export const ZCODE_APP_VERSION_ENV = "ZCODE_APP_VERSION" as const;
 export const ZCODE_BUILD_COMMIT_ID_ENV = "ZCODE_BUILD_COMMIT_ID" as const;
 

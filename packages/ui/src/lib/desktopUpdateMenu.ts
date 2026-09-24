@@ -1,4 +1,5 @@
 import {
+  ZCODE_FORK_DISABLE_UPDATES,
   ZCODE_PRODUCT_FLAVOR,
   type ZCodeProductFlavor,
   type UpdateStatePayload,
@@ -8,7 +9,7 @@ import {
 export function shouldShowDesktopUpdateEntry(
   flavor: ZCodeProductFlavor = ZCODE_PRODUCT_FLAVOR,
 ): boolean {
-  return flavor === "production";
+  return flavor === "production" && !ZCODE_FORK_DISABLE_UPDATES;
 }
 
 export function getUpdateMenuLabelId(state: UpdateStatePayload | null) {
