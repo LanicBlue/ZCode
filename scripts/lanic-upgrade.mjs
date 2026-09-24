@@ -1,0 +1,244 @@
+#!/usr/bin/env node
+/**
+ * Fork 一键升级流水线（LanicBlue/ZCode，本机自建版专用）。
+ *
+ * 把手工趟平的升级序列固化：
+ *   upstream 同步（可跳过）→ 版本递进（可选）→ 构建桌面+CLI → 注入内容插件
+ *   → electron-builder 打包（在 dmg 阶段挂死前收割 .app）→ adhoc 重签
+ *   → 安装 CLI（mv 原子换名）+ 安装 /Applications（按 PID 换 app）
+ *
+ * 坑位对策（都有实证教训，改动前先读）：
+ *   - prepare:runtime-assets 会整删重建 glm —— 内容插件注入必须在 build 之后、
+ *     bundle --skip-prepare --skip-build 之前，没有中间钩子。
+ *   - CLI bundle 嵌 bootstrap/dist —— 改过 zcode-cli 子包的 TS 源码后必须先
+ *     tsc 构建对应包再 build CLI。
+ *   - electron-builder 的 dmg 阶段会无子进程空转挂死 —— 等 .app + zip 出现即 kill。
+ *   - macOS ps 主进程只显示短名 —— 换 /Applications 里的 app 必须按 PID kill，
+ *     否则旧进程抱着被删 bundle 继续跑。
+ *   - T3 kickstart 是部署动作，默认不做，--kickstart-t3 显式触发。
+ *
+ * 用法：
+ *   node scripts/lanic-upgrade.mjs                       # 全流程：upstream+merge+build+装
+ *   node scripts/lanic-upgrade.mjs --no-upstream          # 跳过 upstream 同步（本地改动重建）
+ *   node scripts/lanic-upgrade.mjs --bump                 # 假版本递进（3.14.100→.101）
+ *   node scripts/lanic-upgrade.mjs --production           # 打 "ZCode" 正式身份（替换官方时用；默认 ZCode Preview）
+ *   node scripts/lanic-upgrade.mjs --kickstart-t3         # 尾部重建 T3 server 并 kickstart
+ *   可叠加 --no-push / --no-install-app / --no-install-cli
+ */
+
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const desktopDir = join(repoRoot, "packages", "desktop");
+const cliWorkspace = join(repoRoot, "apps", "zcode-cli");
+const contentPluginsRoot = expandHome("~/.local/zcode-content-plugins");
+const liveCliDir = expandHome("~/.local/zcode-cli");
+
+const args = new Set(process.argv.slice(2));
+const FLAGS = {
+  upstream: !args.has("--no-upstream"),
+  bump: args.has("--bump"),
+  production: args.has("--production"),
+  kickstartT3: args.has("--kickstart-t3"),
+  push: !args.has("--no-push"),
+  installApp: !args.has("--no-install-app"),
+  installCli: !args.has("--no-install-cli"),
+};
+
+const APP_NAME = FLAGS.production ? "ZCode" : "ZCode Preview";
+const previewIdentity = !FLAGS.production;
+
+function expandHome(p) {
+  return p.startsWith("~") ? join(process.env.HOME ?? "", p.slice(1)) : p;
+}
+
+function run(cmd, cwd = repoRoot, env = process.env) {
+  console.log(`\n$ cd ${cwd} && ${cmd}`);
+  execFileSync(cmd, { cwd, env, stdio: "inherit", shell: true });
+}
+
+function step(name) {
+  console.log(`\n=== ${name} ===`);
+}
+
+function fail(message) {
+  console.error(`\n[lanic-upgrade] 失败：${message}`);
+  process.exit(1);
+}
+
+// ── 0. 前置检查 ────────────────────────────────────────────────────────────
+
+step("前置检查");
+if (!existsSync(contentPluginsRoot)) {
+  fail(`内容插件快照缺失：${contentPluginsRoot}（官方退役后这是唯一来源，不能丢）`);
+}
+const snapshotDir = readdirSync(contentPluginsRoot)
+  .filter((d) => d.startsWith("official-"))
+  .sort()
+  .at(-1);
+if (!snapshotDir) fail(`${contentPluginsRoot} 下没有 official-* 快照`);
+const snapshotRoot = join(contentPluginsRoot, snapshotDir);
+console.log(`内容插件快照：${snapshotRoot}`);
+
+const branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoRoot })
+  .toString()
+  .trim();
+if (branch !== "local/lanic") fail(`当前分支是 ${branch}，必须在 local/lanic 上操作`);
+const dirty = execFileSync("git", ["status", "--porcelain"], { cwd: repoRoot }).toString().trim();
+if (dirty) fail(`工作树不干净：\n${dirty}\n（先提交或暂存；流水线不做隐式丢弃）`);
+
+// ── 1. upstream 同步 ──────────────────────────────────────────────────────
+
+if (FLAGS.upstream) {
+  step("upstream 同步");
+  let fetched = false;
+  for (let attempt = 1; attempt <= 3 && !fetched; attempt += 1) {
+    try {
+      run("git fetch upstream main");
+      fetched = true;
+    } catch (error) {
+      console.warn(`fetch 第 ${attempt} 次失败（代理断流常见）：${error.message}`);
+    }
+  }
+  if (!fetched) fail("git fetch upstream 三次失败；检查代理或加 --no-upstream 跳过");
+  run("git merge --no-edit upstream/main");
+}
+
+// ── 2. 版本递进 ────────────────────────────────────────────────────────────
+
+if (FLAGS.bump) {
+  step("版本递进（数字假版本，保 semver）");
+  const pkgPath = join(repoRoot, "package.json");
+  const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(pkg.version ?? "");
+  if (!match) fail(`当前版本 ${pkg.version} 不是纯 semver，递进规则不适用`);
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]) < 100 ? 100 : Number(match[3]) + 1;
+  pkg.version = `${major}.${minor}.${patch}`;
+  writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
+  run(`git add package.json && git commit -m "chore(fork): bump version to ${pkg.version}"`);
+  console.log(`版本 → ${pkg.version}`);
+}
+
+// ── 3. 构建 ────────────────────────────────────────────────────────────────
+
+step("构建桌面（production 后端；remote-assets 是远端 agent 资产，桌面包不需要）");
+run(
+  "ZCODE_ENV=production ZCODE_SKIP_REMOTE_ASSETS=1 pnpm --filter @zcode/desktop build",
+  repoRoot,
+);
+
+step("构建 CLI（bootstrap 先出 dist，CLI bundle 嵌的是它）");
+run("pnpm run build", join(cliWorkspace, "packages", "bootstrap"));
+run("pnpm run build", join(cliWorkspace, "packages", "cli"));
+
+// ── 4. 注入内容插件 ────────────────────────────────────────────────────────
+
+step("注入内容插件（prepare 会整删 glm，注入必须在其后）");
+const glmPackages = join(
+  desktopDir,
+  "bundled-agents",
+  "darwin-arm64",
+  "glm",
+  "packages",
+);
+const builtIn = new Set(["browser-use-plugin", "node-repl-host", "bundled-skills"]);
+if (existsSync(glmPackages)) {
+  for (const entry of readdirSync(glmPackages)) {
+    if (!builtIn.has(entry)) rmSync(join(glmPackages, entry), { recursive: true, force: true });
+  }
+}
+let injected = 0;
+for (const entry of readdirSync(snapshotRoot)) {
+  run(`ditto '${join(snapshotRoot, entry)}' '${join(glmPackages, entry)}'`);
+  injected += 1;
+}
+console.log(`注入 ${injected} 个内容插件（来自 ${snapshotDir}）`);
+
+// ── 5. 打包 + 收割 .app ────────────────────────────────────────────────────
+
+step("electron-builder 打包（skip-prepare/skip-build：产物与注入都已就位）");
+const bundleEnv = {
+  ...process.env,
+  ZCODE_ENV: "production",
+  ...(previewIdentity ? { ZCODE_PREVIEW_IDENTITY: "1" } : {}),
+};
+const builder = spawn(
+  process.execPath,
+  ["scripts/bundle.mjs", "--skip-prepare", "--skip-build"],
+  { cwd: desktopDir, env: bundleEnv, stdio: ["ignore", "pipe", "pipe"] },
+);
+builder.stdout.on("data", (d) => process.stdout.write(`[bundle] ${d}`));
+builder.stderr.on("data", (d) => process.stderr.write(`[bundle!] ${d}`));
+
+const appPath = join(desktopDir, "dist", "mac-arm64", `${APP_NAME}.app`);
+const startedAt = Date.now();
+while (Date.now() - startedAt < 8 * 60_000) {
+  if (existsSync(join(appPath, "Contents", "Resources", "app.asar"))) break;
+  await new Promise((r) => setTimeout(r, 5_000));
+}
+if (!existsSync(join(appPath, "Contents", "Resources", "app.asar"))) {
+  fail("8 分钟内 .app 未产出；查看上方 [bundle] 日志");
+}
+// asar 出现后再给 zip/blockmap 留时间（zip 完成说明 .app 内容已定稿），随后收割。
+await new Promise((r) => setTimeout(r, 25_000));
+for (const signal of ["SIGTERM", "SIGKILL"]) {
+  try {
+    builder.kill(signal);
+  } catch {}
+  await new Promise((r) => setTimeout(r, 1_000));
+}
+run(`codesign --force --deep --sign - '${appPath}'`);
+run(`codesign --verify --deep '${appPath}'`);
+
+// ── 6. 安装 ────────────────────────────────────────────────────────────────
+
+if (FLAGS.installCli) {
+  step("安装 CLI（mv 原子换名，在役进程不受打断）");
+  const cliDist = join(cliWorkspace, "packages", "cli", "dist");
+  run(`cp '${join(cliDist, "zcode.cjs")}' /tmp/lanic-zcode.cjs && mv -f /tmp/lanic-zcode.cjs '${join(liveCliDir, "zcode.cjs")}'`);
+  run(`cp '${join(cliDist, "provider", "zcode-builtin.json")}' /tmp/lanic-builtin.json && mv -f /tmp/lanic-builtin.json '${join(liveCliDir, "provider", "zcode-builtin.json")}'`);
+  run(`node '${join(liveCliDir, "zcode.cjs")}' --version`);
+}
+
+if (FLAGS.installApp) {
+  step(`安装 ${APP_NAME}.app（按 PID 换 app）`);
+  const pidOut = execFileSync(
+    "pgrep",
+    ["-f", `${APP_NAME}.app/Contents/MacOS/${APP_NAME}`],
+    { encoding: "utf8" },
+  ).trim();
+  const pids = pidOut.split("\n").filter(Boolean);
+  for (const pid of pids) {
+    try {
+      process.kill(Number(pid), "SIGTERM");
+    } catch {}
+  }
+  if (pids.length > 0) await new Promise((r) => setTimeout(r, 3_000));
+  rmSync(join("/Applications", `${APP_NAME}.app`), { recursive: true, force: true });
+  run(`ditto '${appPath}' '/Applications/${APP_NAME}.app'`);
+  run(`codesign --verify --deep '/Applications/${APP_NAME}.app'`);
+  run(`open '/Applications/${APP_NAME}.app'`);
+}
+
+// ── 7. push + T3 ───────────────────────────────────────────────────────────
+
+if (FLAGS.push) {
+  step("推送 fork");
+  run("git push origin local/lanic");
+} else {
+  console.log("（--no-push：跳过推送）");
+}
+
+if (FLAGS.kickstartT3) {
+  step("重建并 kickstart T3 server（显式部署动作）");
+  const t3Server = expandHome("~/projects/t3code-expanded/apps/server");
+  run("pnpm run build:bundle", t3Server);
+  run(`launchctl kickstart -k gui/$(id -u)/com.lanic.t3.server`);
+}
+
+console.log(`\n[lanic-upgrade] 完成：${APP_NAME} ${JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).version} 已装。`);
