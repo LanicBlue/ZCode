@@ -49,18 +49,29 @@ try {
     ["swiftc", "-O", "-target", "arm64-apple-macos11", sourcePath, "-o", `${outputPath}-arm64`],
     { stdio: "inherit" },
   );
-  execFileSync(
-    "xcrun",
-    ["swiftc", "-O", "-target", "x86_64-apple-macos11", sourcePath, "-o", `${outputPath}-x86_64`],
-    { stdio: "inherit" },
-  );
-  execFileSync(
-    "lipo",
-    ["-create", `${outputPath}-arm64`, `${outputPath}-x86_64`, "-output", outputPath],
-    { stdio: "inherit" },
-  );
-  execFileSync("rm", ["-f", `${outputPath}-arm64`, `${outputPath}-x86_64`]);
-  console.log(`[window-bounds] 已构建 universal 二进制：${outputPath}`);
+  try {
+    execFileSync(
+      "xcrun",
+      ["swiftc", "-O", "-target", "x86_64-apple-macos11", sourcePath, "-o", `${outputPath}-x86_64`],
+      { stdio: "inherit" },
+    );
+    execFileSync(
+      "lipo",
+      ["-create", `${outputPath}-arm64`, `${outputPath}-x86_64`, "-output", outputPath],
+      { stdio: "inherit" },
+    );
+    execFileSync("rm", ["-f", `${outputPath}-arm64`, `${outputPath}-x86_64`]);
+    console.log(`[window-bounds] 已构建 universal 二进制：${outputPath}`);
+  } catch (crossError) {
+    // Fork：CommandLineTools 的 Swift 运行库可能只有本机架构切片（arm64-only CLT 无法
+    // 链接 x86_64），universal 产不出来。此时退回已构建的本机架构单切片——自建包只在
+    // 本机运行，单架构即可；比留下「无产物→浮窗不吸附」的静默降级好。
+    execFileSync("mv", ["-f", `${outputPath}-arm64`, outputPath]);
+    console.warn(
+      "[window-bounds] x86_64 切片构建失败，退回 arm64 单架构（自建本机运行可用）：",
+      crossError instanceof Error ? crossError.message : String(crossError),
+    );
+  }
 } catch (error) {
   console.warn(
     "[window-bounds] 构建失败；权限浮窗仍可用但不会吸附：",
