@@ -212,6 +212,12 @@ export const buildCli = async ({
   }),
 } = {}) => {
   const cliVersion = await version;
+  // Fork：CLI 构建此前不注入 __ZCODE_VERSION__，运行时落到 "0.0.0-dev" fallback，
+  // 让 runtime store 版本目录与 CDN app_version 参数失真。这里注入仓库根版本，
+  // 与桌面构建（build-metadata.mjs 读同一文件）保持同一版本源。
+  const appVersion = JSON.parse(
+    await readFile(resolve(rootDirectory, "../..", "package.json"), "utf8"),
+  ).version;
   const outfile = resolve(cliDirectory, "dist/zcode.cjs");
   const sourcemapFile = `${outfile}.map`;
   const notices = await readThirdPartyNotices(resolve(rootDirectory, "../.."));
@@ -231,6 +237,7 @@ export const buildCli = async ({
     bundle: true,
     define: {
       __CLI_VERSION__: JSON.stringify(cliVersion),
+      __ZCODE_VERSION__: JSON.stringify(appVersion),
     },
     entryPoints: [resolve(cliDirectory, "src/main.ts")],
     // Ink 7 and yoga-layout use top-level await, so the CJS CLI bundle loads the TUI
