@@ -153,10 +153,19 @@ export async function runZCodeProtocolAgent(
     });
     const runtimeEnv = options.env ?? process.env;
     options.lifecycle?.signal.throwIfAborted();
+    // Fork：协议入口（app-server/agent-server）默认不读共享凭据库——账号 Provider 由宿主
+    // （桌面）经 provider/updateAccountConfig 投递。无宿主投递方（如 T3 直接 spawn）设
+    // ZCODE_PROTOCOL_STANDALONE_ACCOUNTS=1 后，与 prompt/TUI 入口同规则地从凭据库解析账号
+    // Provider。桌面 spawn 不带该 env，行为不变。
+    const standaloneAccountsEnabled = runtimeEnv.ZCODE_PROTOCOL_STANDALONE_ACCOUNTS === "1";
     providerRegistryRuntime = await acquireProtocolStartupResource({
       signal: options.lifecycle?.signal,
       logger,
-      create: () => startProcessProviderRegistryRuntime(runtimeEnv),
+      create: () =>
+        startProcessProviderRegistryRuntime(
+          runtimeEnv,
+          standaloneAccountsEnabled ? { standalone: {} } : {},
+        ),
       disposeLate: (runtime) => runtime.dispose(),
     });
     options.lifecycle?.signal.throwIfAborted();
@@ -254,6 +263,14 @@ export async function runZCodeProtocolAgent(
             activeProviderRegistryRuntime.runtime.registryService,
             activeProviderRegistryRuntime.configuredDefaultModelSelection,
           ),
+          // Fork（standalone 账号）：默认的 providerRuntimeHeadersPort 是"反向请求 Host 要鉴权"；
+          // standalone 模式下凭据库就在本进程，直接注入本地端口，不再要求客户端应答。
+          ...(standaloneAccountsEnabled && activeProviderRegistryRuntime.providerRuntimeHeadersPort
+            ? {
+                providerRuntimeHeadersPort:
+                  activeProviderRegistryRuntime.providerRuntimeHeadersPort,
+              }
+            : {}),
           // 只读同进程已应用快照；不为子任务另发 Host RPC，也不在 ModelFactory 偷换模型。
           resolveEffectiveModelSelection: (selection) => {
             const view = modelSelectionFacade.getView(undefined, undefined, { selection });
