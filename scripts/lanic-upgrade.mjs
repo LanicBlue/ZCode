@@ -172,7 +172,12 @@ const builder = spawn(
   ["scripts/bundle.mjs", "--skip-prepare", "--skip-build"],
   { cwd: desktopDir, env: bundleEnv, stdio: ["ignore", "pipe", "pipe"] },
 );
-builder.stdout.on("data", (d) => process.stdout.write(`[bundle] ${d}`));
+let zipPhaseStarted = false;
+builder.stdout.on("data", (d) => {
+  const text = d.toString();
+  if (text.includes("building block map")) zipPhaseStarted = true;
+  process.stdout.write(`[bundle] ${d}`);
+});
 builder.stderr.on("data", (d) => process.stderr.write(`[bundle!] ${d}`));
 
 const appPath = join(desktopDir, "dist", "mac-arm64", `${APP_NAME}.app`);
@@ -184,8 +189,19 @@ while (Date.now() - startedAt < 8 * 60_000) {
 if (!existsSync(join(appPath, "Contents", "Resources", "app.asar"))) {
   fail("8 分钟内 .app 未产出；查看上方 [bundle] 日志");
 }
-// asar 出现后再给 zip/blockmap 留时间（zip 完成说明 .app 内容已定稿），随后收割。
-await new Promise((r) => setTimeout(r, 25_000));
+// asar 出现 ≠ .app 定稿：Electron 的 locale .pak 等 Framework 资源在 asar 之后
+// 继续落盘，提前收割会打出「locale resources are not loaded」的残包（深签也过）。
+// zip/blockmap 阶段开始才是 .app 内容定稿信号；等不到则超时兜底。
+const zipDeadline = Date.now() + 10 * 60_000;
+while (!zipPhaseStarted && Date.now() < zipDeadline) {
+  await new Promise((r) => setTimeout(r, 3_000));
+}
+if (!zipPhaseStarted) {
+  console.warn("[lanic-upgrade] 未等到 blockmap 阶段，按超时继续（产物可能未定稿）");
+  await new Promise((r) => setTimeout(r, 30_000));
+} else {
+  await new Promise((r) => setTimeout(r, 5_000));
+}
 for (const signal of ["SIGTERM", "SIGKILL"]) {
   try {
     builder.kill(signal);
