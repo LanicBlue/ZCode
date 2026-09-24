@@ -226,18 +226,24 @@ if (FLAGS.installCli) {
 
 if (FLAGS.installApp) {
   step(`安装 ${APP_NAME}.app（按 PID 换 app）`);
-  const pidOut = execFileSync(
-    "pgrep",
-    ["-f", `${APP_NAME}.app/Contents/MacOS/${APP_NAME}`],
-    { encoding: "utf8" },
-  ).trim();
-  const pids = pidOut.split("\n").filter(Boolean);
+  // 主进程 ps 里只显示短名、pgrep -f 匹配不到完整路径：主进程用 -x 精确名，
+  // helper 用 bundle 路径片段；两者缺席都是正常态（首次安装）。
+  const pids = new Set();
+  for (const argv of [["-x", APP_NAME], ["-f", `${APP_NAME}.app/Contents`]]) {
+    try {
+      execFileSync("pgrep", argv, { encoding: "utf8" })
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .forEach((pid) => pids.add(pid));
+    } catch {}
+  }
   for (const pid of pids) {
     try {
       process.kill(Number(pid), "SIGTERM");
     } catch {}
   }
-  if (pids.length > 0) await new Promise((r) => setTimeout(r, 3_000));
+  if (pids.size > 0) await new Promise((r) => setTimeout(r, 3_000));
   rmSync(join("/Applications", `${APP_NAME}.app`), { recursive: true, force: true });
   run(`ditto '${appPath}' '/Applications/${APP_NAME}.app'`);
   run(`codesign --verify --deep '/Applications/${APP_NAME}.app'`);
