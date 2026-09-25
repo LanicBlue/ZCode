@@ -167,6 +167,9 @@ step("electron-builder 打包（skip-prepare/skip-build：产物与注入都已�
 const bundleEnv = {
   ...process.env,
   ZCODE_ENV: "production",
+  // 打包期 ad-hoc 签名：更新 zip 里必须是签名一致的 .app（identity=null 会打出
+  // 未签名 zip，事后重签只救得了 dist 里的 .app 救不了 zip）。
+  ZCODE_FORK_MAC_ADHOC_SIGN: "1",
   ...(previewIdentity ? { ZCODE_PREVIEW_IDENTITY: "1" } : {}),
 };
 const builder = spawn(
