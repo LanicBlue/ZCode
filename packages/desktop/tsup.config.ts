@@ -105,6 +105,10 @@ function createSharedDefines() {
     __ZCODE_FORK_UPDATE_FEED_URL__: JSON.stringify(
       process.env.ZCODE_FORK_UPDATE_FEED_URL?.trim() ?? "",
     ),
+    // Fork：feed 的 Bearer token，网关层做 Authorization 头校验。空 = 无鉴权 feed。
+    __ZCODE_FORK_UPDATE_FEED_TOKEN__: JSON.stringify(
+      process.env.ZCODE_FORK_UPDATE_FEED_TOKEN?.trim() ?? "",
+    ),
     __ZCODE_PRODUCT_FLAVOR__: JSON.stringify(zcodeProductFlavor),
     // Computer Use Helper build identity — helperInstaller 读它决定下载哪个 Helper bundle。
     // 缺失时 installer 抛 "Packaged ZCode is missing its embedded Computer Use Helper build identity"。

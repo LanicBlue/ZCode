@@ -215,6 +215,8 @@ for (const signal of ["SIGTERM", "SIGKILL"]) {
 // 自托管更新源三件套：manifest YAML（legacy path+sha512 形状，ManifestUpdateProvider
 // 原生兼容）+ zip + blockmap（差分更新用）。上传到 ZCODE_FORK_UPDATE_FEED_URL 指向的
 // 目录即构成完整 feed；不设该构建变量时产物照常生成，只是应用端更新链保持关闭。
+// 注意：provider 把文件 URL 解析到域名根（new URL(path, new URL("/", manifestUrl))），
+// feed 挂在子路径下时 yaml 的 path 必须带同样的子目录前缀，否则下载 404。
 {
   const { createHash } = await import("node:crypto");
   const feedDir = join(desktopDir, "dist", "feed");
@@ -225,14 +227,32 @@ for (const signal of ["SIGTERM", "SIGKILL"]) {
   const zipName = `${APP_NAME}-${pkgNow.version}-mac-arm64.zip`;
   const zipPath = join(desktopDir, "dist", zipName);
   if (!existsSync(zipPath)) fail(`feed 产物缺失：${zipPath}`);
+  const feedUrlRaw = process.env.ZCODE_FORK_UPDATE_FEED_URL?.trim() ?? "";
+  let feedPathPrefix = "";
+  if (feedUrlRaw) {
+    let feedUrl;
+    try {
+      feedUrl = new URL(feedUrlRaw);
+    } catch {
+      fail(`ZCODE_FORK_UPDATE_FEED_URL 不是合法 URL：${feedUrlRaw}`);
+    }
+    feedPathPrefix = feedUrl.pathname
+      .slice(0, feedUrl.pathname.lastIndexOf("/") + 1)
+      .replace(/^\/+/, "");
+  }
   const sha512 = createHash("sha512").update(readFileSync(zipPath)).digest("base64");
   copyFileSync(zipPath, join(feedDir, zipName));
   if (existsSync(`${zipPath}.blockmap`)) copyFileSync(`${zipPath}.blockmap`, join(feedDir, `${zipName}.blockmap`));
   wf(
     join(feedDir, "latest-mac.yml"),
-    `version: ${pkgNow.version}\npath: ${zipName}\nsha512: ${sha512}\n`,
+    `version: ${pkgNow.version}\npath: ${feedPathPrefix}${zipName}\nsha512: ${sha512}\n`,
   );
   console.log(`feed 产出：${feedDir}（latest-mac.yml + ${zipName} + blockmap）`);
+  if (feedUrlRaw) {
+    console.log(
+      `feed path 前缀：${feedPathPrefix || "（域名根）"}；把三件套上传到 ${feedUrlRaw} 所在目录即完成发布`,
+    );
+  }
 }
 
 // kill 后 builder 的子进程可能仍在向 .app 内写入（asar repack/unpacked 落盘），

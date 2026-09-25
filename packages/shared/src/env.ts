@@ -9,6 +9,7 @@ export type ArmsRumEnv = "local" | "prod";
 declare const __ZCODE_ENV__: string;
 declare const __ZCODE_PRODUCT_FLAVOR__: string;
 declare const __ZCODE_FORK_UPDATE_FEED_URL__: string;
+declare const __ZCODE_FORK_UPDATE_FEED_TOKEN__: string;
 
 export function normalizeZCodeEnv(value: string | undefined): ZCodeEnv {
   return value?.trim().toLowerCase() === "production" ? "production" : "test";
@@ -47,6 +48,14 @@ export const ZCODE_PRODUCT_FLAVOR = normalizeZCodeProductFlavor(
  */
 export const ZCODE_FORK_UPDATE_FEED_URL: string =
   typeof __ZCODE_FORK_UPDATE_FEED_URL__ !== "undefined" ? __ZCODE_FORK_UPDATE_FEED_URL__ : "";
+
+/**
+ * 自托管 feed 的 Bearer token（构建期 `ZCODE_FORK_UPDATE_FEED_TOKEN` 注入）。
+ * feed 挂在自有服务器上时配合网关层 Authorization 头校验；随 manifest 与
+ * zip/blockmap 下载一并携带。只进自己的私有构建产物，不进仓库。
+ */
+export const ZCODE_FORK_UPDATE_FEED_TOKEN: string =
+  typeof __ZCODE_FORK_UPDATE_FEED_TOKEN__ !== "undefined" ? __ZCODE_FORK_UPDATE_FEED_TOKEN__ : "";
 
 /** 更新入口总门：无自托管 feed 时维持全关（与最初 fork 决策一致）。 */
 export const ZCODE_FORK_DISABLE_UPDATES: boolean = ZCODE_FORK_UPDATE_FEED_URL === "";
