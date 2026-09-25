@@ -761,12 +761,17 @@ function applyManifestUpdateProvider(options: InitAutoUpdaterOptions): void {
   const forkFeedUrl = ZCODE_FORK_UPDATE_FEED_URL.trim();
   const forkFeedToken = ZCODE_FORK_UPDATE_FEED_TOKEN.trim();
   const manifestUrl = forkFeedUrl || options.updateFeedSource?.url.trim();
+  // requestHeaders 不能走 setFeedURL 选项——那条路径不处理它（只有构造函数读）；
+  // 每次 checkForUpdates 前会用 updater.requestHeaders 重算最终头，直接赋值才生效，
+  // 且同时覆盖 manifest 拉取与 zip/blockmap 下载。
+  if (forkFeedToken) {
+    autoUpdater.requestHeaders = { Authorization: `Bearer ${forkFeedToken}` };
+  }
   autoUpdater.setFeedURL({
     provider: "custom",
     updateProvider: ManifestUpdateProvider,
     endpointOrigin: DEFAULT_ZCODE_ENDPOINT_ORIGIN,
     ...(manifestUrl ? { manifestUrl } : {}),
-    ...(forkFeedToken ? { requestHeaders: { Authorization: `Bearer ${forkFeedToken}` } } : {}),
     releasePlatform: getElectronReleasePlatform(),
     deviceMid: options.deviceMid,
     resolveEndpointOrigin:
