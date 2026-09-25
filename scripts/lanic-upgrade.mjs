@@ -210,6 +210,31 @@ for (const signal of ["SIGTERM", "SIGKILL"]) {
   } catch {}
   await new Promise((r) => setTimeout(r, 1_000));
 }
+// kill 只打掉 bundle.mjs 直系进程；孙进程（app-builder 等）可能还在写 dist 里的 zip。
+// 曾经实跑踩过：feed 复制到半截 zip（146MB/187MB）+ zip.blockmap 从未产出，
+// yaml sha512 对残包计算，传上去就是必然校验失败的毒 feed。
+// 定稿判据 = zip 的 blockmap 文件出现（app-builder 在 zip 写完后才生成它）且体积
+// 连续两次采样不变；等不到就 fail，绝不出带病的 feed。
+{
+  const pkgNow = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+  const zipName = `${APP_NAME}-${pkgNow.version}-mac-arm64.zip`;
+  const zipPath = join(desktopDir, "dist", zipName);
+  const blockmapPath = `${zipPath}.blockmap`;
+  const deadline = Date.now() + 8 * 60_000;
+  let lastSize = -1;
+  let stableRounds = 0;
+  while (Date.now() < deadline) {
+    const size = existsSync(zipPath) ? statSync(zipPath).size : -1;
+    stableRounds = size > 0 && size === lastSize ? stableRounds + 1 : 0;
+    if (stableRounds >= 2 && existsSync(blockmapPath)) break;
+    lastSize = size;
+    await new Promise((r) => setTimeout(r, 5_000));
+  }
+  if (!(existsSync(blockmapPath) && stableRounds >= 2)) {
+    fail(`zip 未定稿（blockmap=${existsSync(blockmapPath)} size=${lastSize}）：收割竞态，直接重跑`);
+  }
+  console.log(`zip 定稿：${zipName} ${lastSize} bytes + blockmap`);
+}
 // ── 5.5 更新 feed 产出 ─────────────────────────────────────────────────────
 
 // 自托管更新源三件套：manifest YAML（legacy path+sha512 形状，ManifestUpdateProvider
@@ -242,7 +267,9 @@ for (const signal of ["SIGTERM", "SIGKILL"]) {
   }
   const sha512 = createHash("sha512").update(readFileSync(zipPath)).digest("base64");
   copyFileSync(zipPath, join(feedDir, zipName));
-  if (existsSync(`${zipPath}.blockmap`)) copyFileSync(`${zipPath}.blockmap`, join(feedDir, `${zipName}.blockmap`));
+  // blockmap 是差分更新必需，缺了 electron-updater 整包下载兜底也过不了 —— 直接 fail。
+  if (!existsSync(`${zipPath}.blockmap`)) fail(`feed 产物缺失：${zipPath}.blockmap`);
+  copyFileSync(`${zipPath}.blockmap`, join(feedDir, `${zipName}.blockmap`));
   wf(
     join(feedDir, "latest-mac.yml"),
     `version: ${pkgNow.version}\npath: ${feedPathPrefix}${zipName}\nsha512: ${sha512}\n`,
