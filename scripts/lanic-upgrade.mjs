@@ -204,6 +204,25 @@ if (!zipPhaseStarted) {
 } else {
   await new Promise((r) => setTimeout(r, 5_000));
 }
+// 实测顺序坑：文本信号（任意 "building block map"）常先撞上 DMG 的 blockmap 行，
+// 此时 zip 文件虽已写完、zip 自己的 blockmap 还没算——立即 kill 会把它一起打死，
+// 之后永远等不到（run5 实案：zip.blockmap 缺失 + feed 拿到半截 zip）。
+// 所以信号只当「.app 定稿」用；kill 前先等 zip.blockmap 文件真出现。
+{
+  const pkgNow = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+  const blockmapPath = join(
+    desktopDir, "dist", `${APP_NAME}-${pkgNow.version}-mac-arm64.zip.blockmap`,
+  );
+  const blockmapDeadline = Date.now() + 6 * 60_000;
+  while (!existsSync(blockmapPath) && Date.now() < blockmapDeadline) {
+    await new Promise((r) => setTimeout(r, 5_000));
+  }
+  if (existsSync(blockmapPath)) {
+    console.log("zip.blockmap 已出现，开始收割 kill");
+  } else {
+    console.warn("[lanic-upgrade] 6 分钟未等到 zip.blockmap，继续 kill（定稿闸会把关）");
+  }
+}
 for (const signal of ["SIGTERM", "SIGKILL"]) {
   try {
     builder.kill(signal);
