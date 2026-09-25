@@ -210,6 +210,31 @@ for (const signal of ["SIGTERM", "SIGKILL"]) {
   } catch {}
   await new Promise((r) => setTimeout(r, 1_000));
 }
+// ── 5.5 更新 feed 产出 ─────────────────────────────────────────────────────
+
+// 自托管更新源三件套：manifest YAML（legacy path+sha512 形状，ManifestUpdateProvider
+// 原生兼容）+ zip + blockmap（差分更新用）。上传到 ZCODE_FORK_UPDATE_FEED_URL 指向的
+// 目录即构成完整 feed；不设该构建变量时产物照常生成，只是应用端更新链保持关闭。
+{
+  const { createHash } = await import("node:crypto");
+  const feedDir = join(desktopDir, "dist", "feed");
+  rmSync(feedDir, { recursive: true, force: true });
+  const { mkdirSync, copyFileSync, writeFileSync: wf } = await import("node:fs");
+  mkdirSync(feedDir, { recursive: true });
+  const pkgNow = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+  const zipName = `${APP_NAME}-${pkgNow.version}-mac-arm64.zip`;
+  const zipPath = join(desktopDir, "dist", zipName);
+  if (!existsSync(zipPath)) fail(`feed 产物缺失：${zipPath}`);
+  const sha512 = createHash("sha512").update(readFileSync(zipPath)).digest("base64");
+  copyFileSync(zipPath, join(feedDir, zipName));
+  if (existsSync(`${zipPath}.blockmap`)) copyFileSync(`${zipPath}.blockmap`, join(feedDir, `${zipName}.blockmap`));
+  wf(
+    join(feedDir, "latest-mac.yml"),
+    `version: ${pkgNow.version}\npath: ${zipName}\nsha512: ${sha512}\n`,
+  );
+  console.log(`feed 产出：${feedDir}（latest-mac.yml + ${zipName} + blockmap）`);
+}
+
 // kill 后 builder 的子进程可能仍在向 .app 内写入（asar repack/unpacked 落盘），
 // 立即签名会盖住半成品然后 verify 报 sealed resource invalid。等进程退净再签。
 for (let i = 0; i < 15; i += 1) {

@@ -8,6 +8,7 @@ import {
   getDesktopMenuMessage,
   PlatformChannels,
   resolveRuntimeZCodeEndpointOrigin,
+  ZCODE_FORK_UPDATE_FEED_URL,
   ZCODE_VERSION,
   type ElectronReleaseChannel,
   type Locale,
@@ -752,7 +753,10 @@ async function syncAutoUpdateCheckChannelFromSettings(
 }
 
 function applyManifestUpdateProvider(options: InitAutoUpdaterOptions): void {
-  const manifestUrl = options.updateFeedSource?.url.trim();
+  // Fork 自托管 feed 优先：指向一个静态目录的 manifest YAML（同目录放 zip+blockmap），
+  // provider 会以它为 base 追加 platform/channel 查询参数，静态服务忽略即可。
+  const forkFeedUrl = ZCODE_FORK_UPDATE_FEED_URL.trim();
+  const manifestUrl = forkFeedUrl || options.updateFeedSource?.url.trim();
   autoUpdater.setFeedURL({
     provider: "custom",
     updateProvider: ManifestUpdateProvider,

@@ -101,6 +101,10 @@ function createSharedDefines() {
     __ZCODE_BUILD_TIME__: JSON.stringify(buildMetadata.buildTime),
     __ZCODE_ENV__: JSON.stringify(zcodeEnv),
     __ZCODE_ENDPOINT_ENV__: JSON.stringify(pickProductEndpointEnv(env)),
+    // Fork：自托管更新 feed（manifest YAML 的完整 URL）。空 = 更新链全关。
+    __ZCODE_FORK_UPDATE_FEED_URL__: JSON.stringify(
+      process.env.ZCODE_FORK_UPDATE_FEED_URL?.trim() ?? "",
+    ),
     __ZCODE_PRODUCT_FLAVOR__: JSON.stringify(zcodeProductFlavor),
     // Computer Use Helper build identity — helperInstaller 读它决定下载哪个 Helper bundle。
     // 缺失时 installer 抛 "Packaged ZCode is missing its embedded Computer Use Helper build identity"。

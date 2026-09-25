@@ -8,6 +8,7 @@ export type ArmsRumEnv = "local" | "prod";
 // 非构建环境（如 e2e 测试的 mocha）下 define 不存在，用 typeof 检查 + fallback 避免 ReferenceError
 declare const __ZCODE_ENV__: string;
 declare const __ZCODE_PRODUCT_FLAVOR__: string;
+declare const __ZCODE_FORK_UPDATE_FEED_URL__: string;
 
 export function normalizeZCodeEnv(value: string | undefined): ZCodeEnv {
   return value?.trim().toLowerCase() === "production" ? "production" : "test";
@@ -39,11 +40,16 @@ export const ZCODE_PRODUCT_FLAVOR = normalizeZCodeProductFlavor(
 );
 
 /**
- * Fork 决策（LanicBlue/ZCode）：自编译版本永久关闭整条更新链路——无后台轮询、
- * 无手动检查入口、不参与远端强制升级 gate。版本推进 = git 合并上游后重新构建安装，
- * 因此保留 production 身份（应用名/数据目录与官方版互换），只摘掉更新行为本身。
+ * Fork 决策（LanicBlue/ZCode）：更新链路默认关闭；构建期通过
+ * `ZCODE_FORK_UPDATE_FEED_URL` 注入自托管 feed（指向一个静态目录的 manifest YAML，
+ * 同目录放置 zip+blockmap）后整条链路重新打开，指向自有源——版本检测、手动下载、
+ * 重启安装都走自己的服务器，官方 CDN 不再参与。
  */
-export const ZCODE_FORK_DISABLE_UPDATES: boolean = true;
+export const ZCODE_FORK_UPDATE_FEED_URL: string =
+  typeof __ZCODE_FORK_UPDATE_FEED_URL__ !== "undefined" ? __ZCODE_FORK_UPDATE_FEED_URL__ : "";
+
+/** 更新入口总门：无自托管 feed 时维持全关（与最初 fork 决策一致）。 */
+export const ZCODE_FORK_DISABLE_UPDATES: boolean = ZCODE_FORK_UPDATE_FEED_URL === "";
 export const ZCODE_APP_VERSION_ENV = "ZCODE_APP_VERSION" as const;
 export const ZCODE_BUILD_COMMIT_ID_ENV = "ZCODE_BUILD_COMMIT_ID" as const;
 

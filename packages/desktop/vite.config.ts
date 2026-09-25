@@ -193,6 +193,9 @@ export default defineConfig(({ mode }) => {
       __ZCODE_COMMIT__: JSON.stringify(buildMetadata.buildCommitId),
       __ZCODE_BUILD_TIME__: JSON.stringify(buildMetadata.buildTime),
       __ZCODE_ENV__: JSON.stringify(zcodeEnv),
+      __ZCODE_FORK_UPDATE_FEED_URL__: JSON.stringify(
+        process.env.ZCODE_FORK_UPDATE_FEED_URL?.trim() ?? "",
+      ),
       __ZCODE_PRODUCT_FLAVOR__: JSON.stringify(zcodeProductFlavor),
       __ZCODE_LOCAL_DEVELOPMENT_RUNTIME__: JSON.stringify(mode !== "production"),
       "import.meta.env.VITE_ZCODE_BASE_URL": JSON.stringify(zcodeEndpointOrigin),
