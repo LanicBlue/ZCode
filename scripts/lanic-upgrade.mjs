@@ -390,4 +390,8 @@ if (FLAGS.kickstartT3) {
   run(`launchctl kickstart -k gui/$(id -u)/com.lanic.t3.server`);
 }
 
-console.log(`\n[lanic-upgrade] 完成：${APP_NAME} ${JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).version} 已装。`);
+console.log(
+  `\n[lanic-upgrade] 完成：${APP_NAME} ${JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).version}` +
+    (FLAGS.installApp ? " 已装。" : " 已产出（--no-install-app：未装，app 保持原版本）。") +
+    (process.env.ZCODE_FORK_UPDATE_FEED_URL ? " feed 三件套在 packages/desktop/dist/feed/，上传后即为可更新版本。" : ""),
+);
