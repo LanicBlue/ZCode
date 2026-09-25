@@ -133,7 +133,6 @@ import { applyAppIcon } from "./desktopWindowChrome.js";
 import { resolveWindowsAppUserModelIdForFlavor } from "../../scripts/desktop-product-identity.mjs";
 import type { DesktopWindowSize } from "./desktopWindowSize.js";
 import { maybeWarnArchitectureMismatch } from "./desktopArchitectureGuard.js";
-import { maybeBlockStartupForForceUpdate } from "./forceUpdateGuard.js";
 import { createWindowsDesktopTray, updateWindowsDesktopTrayMenu } from "./desktopTray.js";
 import { createWindowsCuaOperationIndicator } from "./windowsCuaOperationIndicator.js";
 import {
@@ -2014,7 +2013,7 @@ app.whenReady().then(async () => {
   // Preview 身份无论连接哪个后端都不自动更新：stable feed 上只分发正式 ZCode 安装包，
   // 不向 Preview 渠道提供更新。
   void initAutoUpdater({
-    enabled: ZCODE_PRODUCT_FLAVOR === "production" && !ZCODE_FORK_DISABLE_UPDATES,
+    enabled: !ZCODE_FORK_DISABLE_UPDATES,
     onBeforeQuitAndInstall: async () => {
       notifyStabilityLifecycle("update_install");
       await prepareAppQuit("auto-update quitAndInstall", "update-install");
@@ -2255,25 +2254,9 @@ app.whenReady().then(async () => {
   // 分支不 bump 版本），会被 release minimalVersion 误判为"需强制升级"而启动秒退。force-update
   // 是面向打包发布客户端的安全门，对未打包 dev 运行时无意义。打包版 app.isPackaged === true，
   // gate 照常生效，对真实用户零影响。
-  const skipForceUpdateForLocalDevRuntime = !app.isPackaged;
-  const forceUpdateGuardResult =
-    ZCODE_PRODUCT_FLAVOR === "production" &&
-    !ZCODE_FORK_DISABLE_UPDATES &&
-    !skipForceUpdateForLocalDevRuntime
-      ? await maybeBlockStartupForForceUpdate({
-          locale: currentApplicationLocale,
-          logger,
-          endpointOrigin: await resolveCurrentZCodeEndpointOrigin(),
-          onBlocked: () => {
-            forceUpdateMainWindowCreationBlocked = true;
-          },
-        })
-      : { blocked: false };
-  if (ZCODE_PRODUCT_FLAVOR !== "production") {
-    logger.info("[force-update] Preview 跳过远端强制升级检查");
-  } else if (skipForceUpdateForLocalDevRuntime) {
-    logger.info("[force-update] 本地 dev 构建（未打包）跳过远端强制升级检查");
-  }
+  // Fork：强更守卫只服务官方发布渠道（启动时查询官方 minimalVersion 并可阻断），
+  // 自建版本没有该渠道，无论 flavor 与自托管 feed 配置都永不启用。
+  const forceUpdateGuardResult = { blocked: false } as const;
   if (forceUpdateGuardResult.blocked) {
     return;
   }
