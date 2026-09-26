@@ -84,12 +84,13 @@ const macSigningIdentity =
   rawMacSigningIdentity?.replace(/^Developer ID Application:\s*/, "") ?? null;
 const shouldEnableMacSigning =
   process.env.ZCODE_ENABLE_MAC_SIGN === "1" && Boolean(macSigningIdentity);
-// Fork（lanic-upgrade.mjs 恒开）：自建包没有开发者证书，打包期用 ad-hoc 签名（identity "-"）。
-// 签名发生在 afterPack 注入之后、zip 目标之前——更新 zip 里天然是签名一致的 .app。
-// 事后对 dist 里的 .app 重签救不了已打好的 zip（曾实案：zip 残留未签名 app，
-// codesign --verify 报 "no resources but signature indicates they must be present"，
-// 真从 zip 更新装上后 arm64 无法启动）。
-const forkAdhocSigning = process.env.ZCODE_FORK_MAC_ADHOC_SIGN === "1";
+// Fork 签名三级：自签稳定证书（ZCODE_FORK_MAC_SIGN_IDENTITY，Squirrel 更新校验
+// 要求新包与在装应用同证书锚，稳定身份使跨版本更新可行）> ad-hoc（"-"，仅本机
+// 可跑、更新安装必被 Squirrel 拒）> 上游 CI 证书开关。
+// ad-hoc 陷阱备忘：签名发生在 afterPack 注入之后、zip 目标之前——更新 zip 里
+// 天生是签名一致的 .app；事后对 dist 里的 .app 重签救不了已打好的 zip。
+const forkSigningIdentity = process.env.ZCODE_FORK_MAC_SIGN_IDENTITY?.trim() || null;
+const forkAdhocSigning = !forkSigningIdentity && process.env.ZCODE_FORK_MAC_ADHOC_SIGN === "1";
 const workspaceRoot = resolve(import.meta.dirname, "../..");
 const desktopPackageRoot = import.meta.dirname;
 const runtimeModuleLookupRoots = [
@@ -676,7 +677,8 @@ export default {
     // z-code 之前只有本地未签名打包配置，CI 即使注入了证书变量，
     // electron-builder 也不会自动切到 hardened runtime / entitlement 这套发布参数。
     // 这里显式收拢到环境开关，保证本地开发不被签名配置绑死，CI 发布时再按需打开。
-    identity: forkAdhocSigning ? "-" : shouldEnableMacSigning ? macSigningIdentity : null,
+    identity:
+      forkSigningIdentity ?? (forkAdhocSigning ? "-" : shouldEnableMacSigning ? macSigningIdentity : null),
     // macOS 产物采用“build 阶段签名 + 独立公证阶段”的两段式流水线。
     // 如果这里不显式关闭 electron-builder 内置 notarize，它会在 build 阶段读取 Apple 凭据后直接尝试公证，
     // 并强制要求 APPLE_APP_SPECIFIC_PASSWORD，导致 build 还没产出 DMG 就提前失败。

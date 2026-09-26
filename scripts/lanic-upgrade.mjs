@@ -315,14 +315,17 @@ for (let i = 0; i < 15; i += 1) {
   }
 }
 await new Promise((r) => setTimeout(r, 3_000));
-run(`codesign --force --deep --sign - '${appPath}'`);
+// 签名身份：ZCODE_FORK_MAC_SIGN_IDENTITY（自签稳定证书，Squirrel 更新校验要求
+// 「新包与在装应用同证书锚」）优先；否则退回 ad-hoc（"—"）。
+const SIGN_IDENTITY = process.env.ZCODE_FORK_MAC_SIGN_IDENTITY?.trim() || "-";
+run(`codesign --force --deep --sign '${SIGN_IDENTITY}' '${appPath}'`);
 try {
   run(`codesign --verify --deep '${appPath}'`);
 } catch {
   // 兜底一轮：清理残留进程后重签再验。
   run("pkill -9 -f electron-builder || true");
   await new Promise((r) => setTimeout(r, 3_000));
-  run(`codesign --force --deep --sign - '${appPath}'`);
+  run(`codesign --force --deep --sign '${SIGN_IDENTITY}' '${appPath}'`);
   run(`codesign --verify --deep '${appPath}'`);
 }
 
