@@ -2931,6 +2931,11 @@ parentPort.on("message", async (e: Electron.MessageEvent) => {
               services,
               deviceMid: msg.deviceMid,
               logger,
+              // conversation 工作区任务列表（WorkspaceTimelineTasksSection →
+              // useGlobalTaskList）走 window-controller 通道：桥上每连接独立 attachment，
+              // 与桌面窗口 exposeServicesOnMessagePort 的 per-port attachment 同源——
+              // resolveSource 本地分支落 activeServices 的 IZCodeTaskService（真 tasks-index）。
+              createWindowControllerService: windowHostControllerRuntime.createAttachmentService,
             });
             logger.info("[remote-bridge] bridge started inside dedicated host");
           } catch (error) {

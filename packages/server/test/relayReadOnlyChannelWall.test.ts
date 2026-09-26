@@ -126,9 +126,92 @@ test("credential wall forwards load only and blocks save/delete at the relay", a
   assert.deepEqual(recording.forwardedCalls, ["load"], "writes must never reach the host");
 });
 
-test("read-only wall covers exactly the three wrapped channels in the relay whitelist", () => {
+test("usage-stats wall forwards stat reads and blocks vendor reset actions at the relay", async () => {
+  const recording = createRecordingChannel({
+    getSnapshot: { range: "7d", summary: { totalSessions: 2 } },
+    getEntitlementSnapshot: { authenticated: true },
+  });
+  const filtered = createRelayReadOnlyDeviceService<object>(recording.channel, "usage-stats");
+  const serverChannel = ProxyChannel.fromService(filtered);
+
+  assert.deepEqual(await serverChannel.call("ctx", "getSnapshot", [{ range: "7d" }]), {
+    range: "7d",
+    summary: { totalSessions: 2 },
+  });
+  assert.deepEqual(await serverChannel.call("ctx", "getEntitlementSnapshot"), {
+    authenticated: true,
+  });
+
+  // 供应商侧重置动作（use/requestOpportunity/markHistoryRead）在 relay 即拒绝。
+  const blocked = ["useCodingPlanReset", "requestCodingPlanResetOpportunity", "markCodingPlanResetHistoryRead"];
+  for (const method of blocked) {
+    assert.throws(
+      () => serverChannel.call("ctx", method, [null]),
+      /Method not found/,
+      `${method} must be rejected at the relay`,
+    );
+  }
+  assert.deepEqual(recording.forwardedCalls, ["getSnapshot", "getEntitlementSnapshot"]);
+});
+
+test("coding-plan-subscription wall forwards catalog reads and blocks every payment flow at the relay", async () => {
+  const recording = createRecordingChannel({
+    batchPreview: { productList: [], isSubscribed: false, isAuthenticated: true },
+    getOffPeakClientConfig: { enabled: true },
+    preview: { productId: "p1", bizId: "b1" },
+  });
+  const filtered = createRelayReadOnlyDeviceService<object>(
+    recording.channel,
+    "coding-plan-subscription",
+  );
+  const serverChannel = ProxyChannel.fromService(filtered);
+
+  assert.equal((await serverChannel.call("ctx", "batchPreview", [null])).isAuthenticated, true);
+  assert.deepEqual(await serverChannel.call("ctx", "getOffPeakClientConfig", [null]), {
+    enabled: true,
+  });
+  assert.equal((await serverChannel.call("ctx", "preview", [null])).bizId, "b1");
+
+  // 冒充主机的支付收割面：签约/扣款/绑卡/paypal/企业下单续付全部在 relay 拒绝。
+  const blocked = [
+    "createSign",
+    "updateSign",
+    "checkPayment",
+    "checkPendingOrders",
+    "queryStripeCards",
+    "bindStripeCard",
+    "unbindStripeCard",
+    "payStripe",
+    "checkPaypalSupport",
+    "createPaypalSetupToken",
+    "subscribePaypal",
+    "createEnterpriseOrder",
+    "cancelEnterpriseOrder",
+    "continueEnterpriseOrderPayment",
+  ];
+  for (const method of blocked) {
+    assert.throws(
+      () => serverChannel.call("ctx", method, [null]),
+      /Method not found/,
+      `${method} must be rejected at the relay`,
+    );
+  }
+  assert.deepEqual(recording.forwardedCalls, [
+    "batchPreview",
+    "getOffPeakClientConfig",
+    "preview",
+  ]);
+});
+
+test("read-only wall covers exactly the five wrapped channels in the relay whitelist", () => {
   const wallChannels = Object.keys(RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS).sort();
-  assert.deepEqual(wallChannels, ["credential", "oauth", "provider-settings"]);
+  assert.deepEqual(wallChannels, [
+    "coding-plan-subscription",
+    "credential",
+    "oauth",
+    "provider-settings",
+    "usage-stats",
+  ]);
   for (const channelName of wallChannels) {
     assert.equal(
       DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST.some((d) => d.channelName === channelName),
@@ -140,4 +223,15 @@ test("read-only wall covers exactly the three wrapped channels in the relay whit
       `${channelName} must declare at least one allowed read method`,
     );
   }
+  // window-controller 是无方法墙的 raw 透明转发成员：必须在挂载白名单内、且不在墙后。
+  assert.equal(
+    DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST.some((d) => d.channelName === "window-controller"),
+    true,
+    "window-controller must stay in the relay whitelist for conversation workspace task lists",
+  );
+  assert.equal(
+    wallChannels.includes("window-controller"),
+    false,
+    "window-controller must not sit behind the read-only wall",
+  );
 });

@@ -4,18 +4,26 @@ import {
   REMOTE_BRIDGE_CREDENTIAL_PRESENT_PLACEHOLDER,
   REMOTE_BRIDGE_SERVICE_WHITELIST,
   createReadOnlyCredentialService,
+  createReadOnlyCodingPlanSubscriptionService,
   createReadOnlyOAuthService,
+  createReadOnlyUsageStatsService,
   createRedactedProviderSettingsService,
+  createWindowControllerRpcSurface,
   isRemoteBridgeRedactedService,
+  redactOffPeakClientConfig,
   redactProviderSettingsView,
   registerRedactedChannel,
   resolveRemoteBridgeChannelRuling,
   resolveRemoteBridgeCredentialKeyRuling,
 } from "../src/host/remoteBridge.js";
 import {
+  ICodingPlanSubscriptionService,
   ICredentialService,
   IOAuthService,
   IProviderSettingsService,
+  IUsageStatsService,
+  IWindowControllerService,
+  type OffPeakClientConfig,
   type ProviderSettingsView,
 } from "@zcode/services";
 import type { ChannelServer } from "@zcode/rpc";
@@ -543,15 +551,326 @@ test("credential read errors are sanitized (no device stack)", async () => {
   assert.equal((caught as Error & { code?: unknown }).code, undefined);
 });
 
+// ── usage-stats：读面放行、供应商侧重置动作全拒、消毒 ────────────────────────
+
+/**
+ * 模拟真实 UsageStatsService：读方法可触底（设备侧代取——真凭据只在此侧用于调
+ * 供应商统计接口）；useCodingPlanReset/requestCodingPlanResetOpportunity/
+ * markCodingPlanResetHistoryRead 是供应商侧动作，包装外绝不允许触底。
+ */
+function createFakeUsageStatsService(): IUsageStatsService & { calls: string[] } {
+  const calls: string[] = [];
+  const read = (name: string, value: unknown): unknown => {
+    calls.push(name);
+    return value;
+  };
+  const vendorMutation = (name: string): Promise<never> => {
+    calls.push(name);
+    return Promise.reject(new Error(`vendor mutation ${name} leaked to the device service`));
+  };
+  return {
+    calls,
+    getAppUsageSnapshot: async () =>
+      read("getAppUsageSnapshot", { range: "7d", source: "agent-db", summary: { totalTokens: 1 } }),
+    getCodingPlanUsageSnapshot: async () =>
+      read("getCodingPlanUsageSnapshot", { range: "today", quota: { level: null, limits: [] } }),
+    getCodingPlanResetStatus: async () =>
+      read("getCodingPlanResetStatus", {
+        availableFiveHourResets: [],
+        availableWeekResets: [],
+        hasUnreadHistory: false,
+      }),
+    getSnapshot: async () => read("getSnapshot", { range: "7d", summary: { totalSessions: 2 } }),
+    getEntitlementSnapshot: async () =>
+      read("getEntitlementSnapshot", { authenticated: true, remaining: { count: 5, isShow: true } }),
+    requestCodingPlanResetOpportunity: () => vendorMutation("requestCodingPlanResetOpportunity"),
+    useCodingPlanReset: () => vendorMutation("useCodingPlanReset"),
+    markCodingPlanResetHistoryRead: () => vendorMutation("markCodingPlanResetHistoryRead"),
+  } as unknown as IUsageStatsService & { calls: string[] };
+}
+
+test("read-only usage-stats service passes the five stat reads through to the device service", async () => {
+  const fake = createFakeUsageStatsService();
+  const wrapped = createReadOnlyUsageStatsService(fake);
+
+  assert.equal((await wrapped.getAppUsageSnapshot({ range: "7d" })).range, "7d");
+  assert.equal((await wrapped.getCodingPlanUsageSnapshot(null as never)).range, "today");
+  assert.equal((await wrapped.getCodingPlanResetStatus(null as never)).hasUnreadHistory, false);
+  assert.equal((await wrapped.getSnapshot({ range: "7d" })).summary.totalSessions, 2);
+  assert.equal((await wrapped.getEntitlementSnapshot()).authenticated, true);
+  assert.deepEqual(fake.calls, [
+    "getAppUsageSnapshot",
+    "getCodingPlanUsageSnapshot",
+    "getCodingPlanResetStatus",
+    "getSnapshot",
+    "getEntitlementSnapshot",
+  ]);
+});
+
+test("read-only usage-stats service rejects vendor-side reset actions without touching the device service", () => {
+  const fake = createFakeUsageStatsService();
+  const wrapped = createReadOnlyUsageStatsService(fake);
+  const rejections: Array<() => unknown> = [
+    () => wrapped.useCodingPlanReset(null as never),
+    () => wrapped.requestCodingPlanResetOpportunity(null as never),
+    () => wrapped.markCodingPlanResetHistoryRead(null as never),
+  ];
+  for (const attempt of rejections) {
+    assert.throws(
+      attempt,
+      /usage-stats\.\w+ is not available on the remote bridge \(read-only channel\)/,
+    );
+  }
+  assert.deepEqual(fake.calls, [], "reset actions must not reach the device service");
+});
+
+test("usage-stats read errors are sanitized (no device stack)", async () => {
+  const fake = createFakeUsageStatsService();
+  const leaky = new Error("monitor api request failed");
+  leaky.stack = "Error: monitor api request failed\n    at /Users/device/zcode/packages/...";
+  fake.getSnapshot = async () => {
+    throw leaky;
+  };
+  const wrapped = createReadOnlyUsageStatsService(fake);
+
+  const caught = await wrapped.getSnapshot({ range: "7d" }).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.message, "monitor api request failed");
+  assert.equal(caught.stack, undefined);
+});
+
+// ── coding-plan-subscription：订阅读面 + 支付流全拒 + offpeak 脱敏 ───────────
+
+function createFakeCodingPlanSubscriptionService(): ICodingPlanSubscriptionService & {
+  calls: string[];
+} {
+  const calls: string[] = [];
+  const read = (name: string, value: unknown): unknown => {
+    calls.push(name);
+    return value;
+  };
+  const paymentFlow = (name: string): Promise<never> => {
+    calls.push(name);
+    return Promise.reject(new Error(`payment flow ${name} leaked to the device service`));
+  };
+  return {
+    calls,
+    batchPreview: async () => read("batchPreview", { productList: [], isSubscribed: false, isAuthenticated: true }),
+    getStaticProducts: async () => read("getStaticProducts", {}),
+    getStaticTeamProducts: async () => read("getStaticTeamProducts", {}),
+    getStartPlanPreview: async () => read("getStartPlanPreview", { planId: "start", name: "Start", entitlements: [] }),
+    getOffPeakClientConfig: async () =>
+      read("getOffPeakClientConfig", {
+        enabled: true,
+        modelSelectionView: {
+          revision: 1,
+          providers: [
+            {
+              providerId: "offpeak",
+              config: {
+                access: { type: "api-key", apiKey: "offpeak-real-key", apiKeyManagementUrl: "https://manage" },
+                api: { type: "openai", baseUrl: "https://offpeak.example", headers: { Authorization: "Bearer offpeak-secret" } },
+              },
+            },
+          ],
+        },
+      }),
+    getDynamicWorkflowClientConfig: async () =>
+      read("getDynamicWorkflowClientConfig", { mode: "on_demand", enabled: true, source: "remote" }),
+    getModelContextBudgetStrategy: async () => read("getModelContextBudgetStrategy", "preflight-v1"),
+    getForceUpdateConfig: async () => read("getForceUpdateConfig", { minimalVersion: "1.0.0" }),
+    productInfo: async () => read("productInfo", { productId: "p1" }),
+    preview: async () => read("preview", { productId: "p1", bizId: "b1", payAmount: 1 }),
+    getEnterprisePricing: async () => read("getEnterprisePricing", { productList: [] }),
+    getEnterpriseBalance: async () => read("getEnterpriseBalance", { giveBalance: 0, cashBalance: 0, totalBalance: 0 }),
+    calculateEnterpriseOrder: async () =>
+      read("calculateEnterpriseOrder", { totalOriginalAmount: 0, totalPayAmount: 0, thirdPayAmount: 0 }),
+    getEnterprisePendingOrders: async () => read("getEnterprisePendingOrders", []),
+    checkEnterpriseOrderStatus: async () =>
+      read("checkEnterpriseOrderStatus", { orderNo: "o1", paymentStatus: "WAIT_PAY" }),
+    createSign: () => paymentFlow("createSign"),
+    updateSign: () => paymentFlow("updateSign"),
+    checkPayment: () => paymentFlow("checkPayment"),
+    checkPendingOrders: () => paymentFlow("checkPendingOrders"),
+    queryStripeCards: () => paymentFlow("queryStripeCards"),
+    bindStripeCard: () => paymentFlow("bindStripeCard"),
+    unbindStripeCard: () => paymentFlow("unbindStripeCard"),
+    payStripe: () => paymentFlow("payStripe"),
+    checkPaypalSupport: () => paymentFlow("checkPaypalSupport"),
+    createPaypalSetupToken: () => paymentFlow("createPaypalSetupToken"),
+    subscribePaypal: () => paymentFlow("subscribePaypal"),
+    createEnterpriseOrder: () => paymentFlow("createEnterpriseOrder"),
+    cancelEnterpriseOrder: () => paymentFlow("cancelEnterpriseOrder"),
+    continueEnterpriseOrderPayment: () => paymentFlow("continueEnterpriseOrderPayment"),
+  } as unknown as ICodingPlanSubscriptionService & { calls: string[] };
+}
+
+test("read-only coding-plan-subscription service passes catalog/pricing/order-status reads through", async () => {
+  const fake = createFakeCodingPlanSubscriptionService();
+  const wrapped = createReadOnlyCodingPlanSubscriptionService(fake);
+
+  assert.equal((await wrapped.batchPreview()).isAuthenticated, true);
+  assert.deepEqual(await wrapped.getStaticProducts(), {});
+  assert.deepEqual(await wrapped.getStaticTeamProducts(), {});
+  assert.equal((await wrapped.getStartPlanPreview()).planId, "start");
+  assert.equal((await wrapped.getOffPeakClientConfig()).enabled, true);
+  assert.equal((await wrapped.getDynamicWorkflowClientConfig()).enabled, true);
+  assert.equal(await wrapped.getModelContextBudgetStrategy(), "preflight-v1");
+  assert.equal((await wrapped.getForceUpdateConfig()).minimalVersion, "1.0.0");
+  assert.equal((await wrapped.productInfo(null as never)).productId, "p1");
+  assert.equal((await wrapped.preview(null as never)).bizId, "b1");
+  assert.equal((await wrapped.getEnterprisePricing(null as never)).productList.length, 0);
+  assert.equal((await wrapped.getEnterpriseBalance()).totalBalance, 0);
+  assert.equal((await wrapped.calculateEnterpriseOrder(null as never)).thirdPayAmount, 0);
+  assert.equal((await wrapped.getEnterprisePendingOrders()).length, 0);
+  assert.equal((await wrapped.checkEnterpriseOrderStatus(null as never)).orderNo, "o1");
+  assert.deepEqual(fake.calls, [
+    "batchPreview",
+    "getStaticProducts",
+    "getStaticTeamProducts",
+    "getStartPlanPreview",
+    "getOffPeakClientConfig",
+    "getDynamicWorkflowClientConfig",
+    "getModelContextBudgetStrategy",
+    "getForceUpdateConfig",
+    "productInfo",
+    "preview",
+    "getEnterprisePricing",
+    "getEnterpriseBalance",
+    "calculateEnterpriseOrder",
+    "getEnterprisePendingOrders",
+    "checkEnterpriseOrderStatus",
+  ]);
+});
+
+test("read-only coding-plan-subscription service strips credentials from getOffPeakClientConfig's embedded modelSelectionView", async () => {
+  const fake = createFakeCodingPlanSubscriptionService();
+  const wrapped = createReadOnlyCodingPlanSubscriptionService(fake);
+
+  const config = await wrapped.getOffPeakClientConfig();
+  const provider = config.modelSelectionView.providers[0] as unknown as {
+    config: {
+      access: Record<string, unknown> | undefined;
+      api: Record<string, unknown> | undefined;
+    };
+  };
+  assert.equal(provider.config.access?.apiKey, undefined);
+  assert.equal(provider.config.access?.apiKeyManagementUrl, undefined);
+  assert.equal(provider.config.api?.headers, undefined);
+  // 非凭据字段保留：入口开关与模型展示元数据。
+  assert.equal(config.enabled, true);
+  assert.equal(provider.config.api?.baseUrl, "https://offpeak.example");
+});
+
+test("redactOffPeakClientConfig keeps credential-free configs on the same reference", () => {
+  const clean = {
+    enabled: false,
+    modelSelectionView: { revision: 1, providers: [{ providerId: "p", config: { api: { type: "openai" } } }] },
+  } as unknown as OffPeakClientConfig;
+  assert.strictEqual(redactOffPeakClientConfig(clean), clean);
+});
+
+test("read-only coding-plan-subscription service rejects every payment-flow method without touching the device service", () => {
+  const fake = createFakeCodingPlanSubscriptionService();
+  const wrapped = createReadOnlyCodingPlanSubscriptionService(fake);
+  const rejections: Array<() => unknown> = [
+    () => wrapped.createSign(null as never),
+    () => wrapped.updateSign(null as never),
+    () => wrapped.checkPayment(null as never),
+    () => wrapped.checkPendingOrders(null as never),
+    () => wrapped.queryStripeCards(null as never),
+    () => wrapped.bindStripeCard(null as never),
+    () => wrapped.unbindStripeCard(null as never),
+    () => wrapped.payStripe(null as never),
+    () => wrapped.checkPaypalSupport(null as never),
+    () => wrapped.createPaypalSetupToken(null as never),
+    () => wrapped.subscribePaypal(null as never),
+    () => wrapped.createEnterpriseOrder(null as never),
+    () => wrapped.cancelEnterpriseOrder(null as never),
+    () => wrapped.continueEnterpriseOrderPayment(null as never),
+  ];
+  for (const attempt of rejections) {
+    assert.throws(
+      attempt,
+      /coding-plan-subscription\.\w+ is not available on the remote bridge \(read-only channel\)/,
+    );
+  }
+  assert.deepEqual(fake.calls, [], "payment flows must not reach the device service");
+});
+
+test("coding-plan-subscription read errors are sanitized (no device stack)", async () => {
+  const fake = createFakeCodingPlanSubscriptionService();
+  const leaky = new Error("subscription vendor 5xx");
+  leaky.stack = "Error: subscription vendor 5xx\n    at /Users/device/zcode/out/host/...";
+  fake.getStaticProducts = async () => {
+    throw leaky;
+  };
+  const wrapped = createReadOnlyCodingPlanSubscriptionService(fake);
+
+  const caught = await wrapped.getStaticProducts().then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.message, "subscription vendor 5xx");
+  assert.equal(caught.stack, undefined);
+});
+
+// ── window-controller：raw 暴露、7 接口成员全放行、生命周期钩子不出网 ────────
+
+test("window-controller rpc surface keeps all 7 interface members and strips the device-side dispose hook", () => {
+  let disposed = 0;
+  const attachment = {
+    listTaskList: async () => ({ items: [], total: 0, hasMore: false }),
+    subscribeControllerV4: async () => ({ ack: { subscriptionId: "s1", logEpoch: 1, seq: 0 } }),
+    resyncControllerV4: async () => ({ ack: { subscriptionId: "s1", logEpoch: 1, seq: 0 } }),
+    unsubscribeControllerV4: async () => {},
+    onDynamicControllerFrame: () => () => ({ dispose() {} }),
+    mutateTask: async () => null,
+    deleteArchivedTask: async () => true,
+    deleteArchivedTasks: async () => ({ deletedTaskIds: [], skippedTaskIds: [], failedTaskIds: [] }),
+    dispose: () => {
+      disposed += 1;
+    },
+  } as unknown as IWindowControllerService & { dispose(): void };
+  const rpcSurface = createWindowControllerRpcSurface(attachment) as unknown as Record<
+    string,
+    unknown
+  >;
+  for (const member of [
+    "listTaskList",
+    "subscribeControllerV4",
+    "resyncControllerV4",
+    "unsubscribeControllerV4",
+    "onDynamicControllerFrame",
+    "mutateTask",
+    "deleteArchivedTask",
+    "deleteArchivedTasks",
+  ]) {
+    assert.equal(typeof rpcSurface[member], "function", `rpc surface must expose ${member}`);
+  }
+  // dispose 是设备侧生命周期钩子（挂连接清理），绝不出现在 RPC 面上。
+  assert.equal("dispose" in rpcSurface, false);
+  assert.equal(rpcSurface.dispose, undefined);
+  assert.equal(disposed, 0);
+});
+
 // ── 注册结构：brand、结构化裁决、raw 直注册 fail ────────────────────────────
 
 test("only wrapper factories produce redacted-branded instances (raw services are rejected by the brand check)", () => {
   const fakeOAuth = createFakeOAuthService();
   const fakeSettings = createFakeProviderSettingsService(buildProviderSettingsView());
   const fakeCredential = createFakeCredentialService();
+  const fakeUsageStats = createFakeUsageStatsService();
+  const fakeSubscription = createFakeCodingPlanSubscriptionService();
   assert.equal(isRemoteBridgeRedactedService(fakeOAuth), false);
   assert.equal(isRemoteBridgeRedactedService(fakeSettings), false);
   assert.equal(isRemoteBridgeRedactedService(fakeCredential), false);
+  assert.equal(isRemoteBridgeRedactedService(fakeUsageStats), false);
+  assert.equal(isRemoteBridgeRedactedService(fakeSubscription), false);
   assert.equal(isRemoteBridgeRedactedService(createReadOnlyOAuthService(fakeOAuth)), true);
   assert.equal(
     isRemoteBridgeRedactedService(createRedactedProviderSettingsService(fakeSettings)),
@@ -559,6 +878,11 @@ test("only wrapper factories produce redacted-branded instances (raw services ar
   );
   assert.equal(
     isRemoteBridgeRedactedService(createReadOnlyCredentialService(fakeCredential)),
+    true,
+  );
+  assert.equal(isRemoteBridgeRedactedService(createReadOnlyUsageStatsService(fakeUsageStats)), true);
+  assert.equal(
+    isRemoteBridgeRedactedService(createReadOnlyCodingPlanSubscriptionService(fakeSubscription)),
     true,
   );
 });
@@ -589,31 +913,54 @@ test("every bridge whitelist channel has an explicit wrapped/raw ruling (structu
     assert.notEqual(ruling, "forbidden", `${descriptor.channelName} must not be forbidden`);
     rulings[descriptor.channelName] = ruling;
   }
-  // 凭据邻接通道裁决：provisioning-target 禁；oauth/provider-settings/credential 只许 wrapped。
+  // 凭据邻接通道裁决：provisioning-target 禁；oauth/provider-settings/credential/
+  // usage-stats/coding-plan-subscription 只许 wrapped；window-controller 与 zcode-agent
+  // 同级信任（用户内容面），raw 放行。
   assert.equal(resolveRemoteBridgeChannelRuling("provider-provisioning-target"), "forbidden");
   assert.equal(resolveRemoteBridgeChannelRuling(IOAuthService.channelName), "wrapped");
   assert.equal(resolveRemoteBridgeChannelRuling(IProviderSettingsService.channelName), "wrapped");
   assert.equal(resolveRemoteBridgeChannelRuling(ICredentialService.channelName), "wrapped");
+  assert.equal(resolveRemoteBridgeChannelRuling(IUsageStatsService.channelName), "wrapped");
+  assert.equal(
+    resolveRemoteBridgeChannelRuling(ICodingPlanSubscriptionService.channelName),
+    "wrapped",
+  );
+  assert.equal(resolveRemoteBridgeChannelRuling(IWindowControllerService.channelName), "raw");
   assert.equal(resolveRemoteBridgeChannelRuling("model-selection"), "wrapped");
   assert.equal(rulings["oauth"], "wrapped");
   assert.equal(rulings["provider-settings"], "wrapped");
   assert.equal(rulings["credential"], "wrapped");
+  assert.equal(rulings["usage-stats"], "wrapped");
+  assert.equal(rulings["coding-plan-subscription"], "wrapped");
+  assert.equal(rulings["window-controller"], "raw");
   assert.equal(rulings["setting"], "raw");
   assert.equal(resolveRemoteBridgeChannelRuling("git"), "unruled");
   // 原版 UI 按 channel name 取服务：包装注册必须落在同名通道上。
   assert.equal(IOAuthService.channelName, "oauth");
   assert.equal(IProviderSettingsService.channelName, "provider-settings");
   assert.equal(ICredentialService.channelName, "credential");
+  assert.equal(IUsageStatsService.channelName, "usage-stats");
+  assert.equal(ICodingPlanSubscriptionService.channelName, "coding-plan-subscription");
+  assert.equal(IWindowControllerService.channelName, "window-controller");
 });
 
 // ── relay：方法级第二道墙与两侧镜像 ──────────────────────────────────────────
 
-test("relay keeps provider-provisioning-target forbidden and proxies the three wrapped channels", () => {
+test("relay keeps provider-provisioning-target forbidden and proxies the five wrapped channels plus raw window-controller", () => {
   const whitelist = DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST.map((d) => d.channelName);
   const forbidden = RELAY_FORBIDDEN_DEVICE_SERVICES.map((d) => d.channelName);
   assert.equal(whitelist.includes("oauth"), true);
   assert.equal(whitelist.includes("provider-settings"), true);
   assert.equal(whitelist.includes("credential"), true);
+  assert.equal(whitelist.includes("usage-stats"), true);
+  assert.equal(whitelist.includes("coding-plan-subscription"), true);
+  // window-controller 走无方法墙的透明转发（用户内容面，与 zcode-agent 同级信任）。
+  assert.equal(whitelist.includes("window-controller"), true);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS, "window-controller"),
+    false,
+    "window-controller is raw on the relay; it must not appear behind the read-only wall",
+  );
   assert.deepEqual(forbidden, ["provider-provisioning-target"]);
   for (const name of forbidden) {
     assert.equal(whitelist.includes(name), false, `relay whitelist must not include ${name}`);
@@ -635,6 +982,35 @@ test("relay read-only method wall mirrors the device-side wrapper read surface",
   ]);
   // credential：relay 只放 load（键策略在设备侧包装内裁决，relay 不重复键级逻辑）。
   assert.deepEqual([...RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS["credential"]!], ["load"]);
+  // usage-stats：5 个统计读；重置动作（use/requestOpportunity/markHistoryRead）两侧都不放。
+  assert.deepEqual([...RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS["usage-stats"]!].sort(), [
+    "getAppUsageSnapshot",
+    "getCodingPlanResetStatus",
+    "getCodingPlanUsageSnapshot",
+    "getEntitlementSnapshot",
+    "getSnapshot",
+  ]);
+  // coding-plan-subscription：15 个目录/定价/订单状态读；支付流两侧都拒。
+  assert.deepEqual(
+    [...RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS["coding-plan-subscription"]!].sort(),
+    [
+      "batchPreview",
+      "calculateEnterpriseOrder",
+      "checkEnterpriseOrderStatus",
+      "getDynamicWorkflowClientConfig",
+      "getEnterpriseBalance",
+      "getEnterprisePendingOrders",
+      "getEnterprisePricing",
+      "getForceUpdateConfig",
+      "getModelContextBudgetStrategy",
+      "getOffPeakClientConfig",
+      "getStartPlanPreview",
+      "getStaticProducts",
+      "getStaticTeamProducts",
+      "preview",
+      "productInfo",
+    ],
+  );
   // 镜像的每个方法在设备包装上必须是真实存在的函数成员。
   const oauth = createReadOnlyOAuthService(createFakeOAuthService()) as unknown as Record<
     string,
@@ -658,5 +1034,21 @@ test("relay read-only method wall mirrors the device-side wrapper read surface",
   ) as unknown as Record<string, unknown>;
   for (const method of RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS["credential"]!) {
     assert.equal(typeof credential[method], "function", `credential wrapper must expose ${method}`);
+  }
+  const usageStats = createReadOnlyUsageStatsService(
+    createFakeUsageStatsService(),
+  ) as unknown as Record<string, unknown>;
+  for (const method of RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS["usage-stats"]!) {
+    assert.equal(typeof usageStats[method], "function", `usage-stats wrapper must expose ${method}`);
+  }
+  const subscription = createReadOnlyCodingPlanSubscriptionService(
+    createFakeCodingPlanSubscriptionService(),
+  ) as unknown as Record<string, unknown>;
+  for (const method of RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS["coding-plan-subscription"]!) {
+    assert.equal(
+      typeof subscription[method],
+      "function",
+      `coding-plan-subscription wrapper must expose ${method}`,
+    );
   }
 });

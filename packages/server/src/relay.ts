@@ -32,6 +32,7 @@ import { ChannelClient, ProxyChannel, SocketProtocol, type IChannel } from "@zco
 import {
   ServiceCollection,
   IBroadcastService,
+  ICodingPlanSubscriptionService,
   ICredentialService,
   IFileService,
   IModelSelectionService,
@@ -40,6 +41,8 @@ import {
   IProviderSettingsService,
   ISettingService,
   ITerminalService,
+  IUsageStatsService,
+  IWindowControllerService,
   IZCodeAgentService,
   IZCodeSessionService,
   IZCodeTaskService,
@@ -124,11 +127,13 @@ export const RELAY_FORBIDDEN_DEVICE_SERVICES: readonly ServiceDescriptor<unknown
 ];
 
 /**
- * 方法级第二道墙：这三条通道在 relay 侧只放读方法，成员表与设备侧包装放行面镜像
+ * 方法级第二道墙：这五条通道在 relay 侧只放读方法，成员表与设备侧包装放行面镜像
  * （desktop remoteBridge.ts createReadOnlyOAuthService /
- * createRedactedProviderSettingsService / createReadOnlyCredentialService；oauth 的
- * restoreCachedSession/restoreCachedSessionState 在设备侧经 peekCachedSessionState
- * dry 合成；credential.load 的逐键裁决在设备侧包装内，relay 不重复键策略）。
+ * createRedactedProviderSettingsService / createReadOnlyCredentialService /
+ * createReadOnlyUsageStatsService / createReadOnlyCodingPlanSubscriptionService；
+ * oauth 的 restoreCachedSession/restoreCachedSessionState 在设备侧经
+ * peekCachedSessionState dry 合成；credential.load 的逐键裁决在设备侧包装内，
+ * relay 不重复键策略）。
  * 两表方向性漂移是安全的：设备侧多放一个方法而 relay 未跟 → 调用在 relay
  * 被拒（可见失败）；relay 多放而设备未跟 → 调用在设备被拒。
  */
@@ -141,6 +146,34 @@ export const RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS: Readonly<Record<string, rea
   ],
   [IProviderSettingsService.channelName]: ["getView", "refresh", "onDidChange"],
   [ICredentialService.channelName]: ["load"],
+  // usage-stats：读面=设备侧包装的 5 个统计读；重置动作（use/requestOpportunity/
+  // markHistoryRead）两侧都不放——设备侧包装拒绝 + 本侧 Method not found 双道生效。
+  [IUsageStatsService.channelName]: [
+    "getAppUsageSnapshot",
+    "getCodingPlanUsageSnapshot",
+    "getCodingPlanResetStatus",
+    "getSnapshot",
+    "getEntitlementSnapshot",
+  ],
+  // coding-plan-subscription：读面=设备侧包装放行的 15 个目录/定价/订单状态读；
+  // 支付流（sign/pay/stripe/paypal/enterprise 下单续付）两侧都拒。
+  [ICodingPlanSubscriptionService.channelName]: [
+    "batchPreview",
+    "getStaticProducts",
+    "getStaticTeamProducts",
+    "getStartPlanPreview",
+    "getOffPeakClientConfig",
+    "getDynamicWorkflowClientConfig",
+    "getModelContextBudgetStrategy",
+    "getForceUpdateConfig",
+    "productInfo",
+    "preview",
+    "getEnterprisePricing",
+    "getEnterpriseBalance",
+    "calculateEnterpriseOrder",
+    "getEnterprisePendingOrders",
+    "checkEnterpriseOrderStatus",
+  ],
 };
 
 /**
@@ -179,12 +212,18 @@ export const DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST: readonly ServiceDescriptor<
   IZCodeAgentService,
   IZCodeSessionService,
   IZCodeTaskService,
+  // conversation 工作区任务列表通道：任务元数据/活动帧/置顶归档是用户内容面（非凭据面），
+  // 与 zcode-agent/zcode-task 同级信任——无方法墙，透明转发（含 onDynamicControllerFrame）。
+  IWindowControllerService,
   IFileService,
   ITerminalService,
   IBroadcastService,
   IOAuthService,
   IProviderSettingsService,
   ICredentialService,
+  // 用量面板/订阅目录读：设备侧只读脱敏包装（第一道）+ 本侧方法墙（第二道）。
+  IUsageStatsService,
+  ICodingPlanSubscriptionService,
 ];
 
 /** /devices 列表项（JSON API 与小页共用形状）。 */

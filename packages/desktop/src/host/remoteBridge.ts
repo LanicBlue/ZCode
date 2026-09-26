@@ -48,6 +48,7 @@ import {
 } from "@zcode/rpc";
 import {
   IBroadcastService,
+  ICodingPlanSubscriptionService,
   ICredentialService,
   IFileService,
   IModelSelectionService,
@@ -55,10 +56,13 @@ import {
   IProviderSettingsService,
   ISettingService,
   ITerminalService,
+  IUsageStatsService,
+  IWindowControllerService,
   IZCodeAgentService,
   IZCodeSessionService,
   IZCodeTaskService,
   createZCodeAgentConnectionScope,
+  type OffPeakClientConfig,
   type ProviderSettingsView,
   type ServiceCollection,
   type ServiceDescriptor,
@@ -96,6 +100,13 @@ interface RemoteBridgeLogger {
  * - IBroadcastService：缺=纯降级但零风险，StoreProvider/IntlProvider 语义前提。
  * - IModelSelectionService / IOAuthService / IProviderSettingsService / ICredentialService：
  *   wrapped-only（见下）。
+ * - IWindowControllerService：raw（与 zcode-agent 同级信任——任务元数据/活动帧/置顶归档
+ *   等 mutation 是用户内容面，非凭据面）。conversation 工作区任务列表走它
+ *   （WorkspaceTimelineTasksSection → useGlobalTaskList），实例不来自 services 集合：
+ *   每连接经 createWindowControllerService 工厂建独立 attachment（帧 emitter + 订阅
+ *   随连接销毁，复用桌面窗口 exposeServicesOnMessagePort 的 createAttachmentService）。
+ * - IUsageStatsService / ICodingPlanSubscriptionService：wrapped-only（用量面板/订阅读面
+ *   经设备侧代取真凭据调供应商接口后只回统计；重置/支付流全拒，见下方包装注释）。
  * IGitService / ISystemService 未入（缺=降级不挂，K2 实测），保持排除收窄审查面。
  * 每个成员必须落在 REMOTE_BRIDGE_REDACTED_CHANNELS（wrapped）或
  * REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES（raw）之一，否则启动即 fail——新服务入桥
@@ -106,6 +117,7 @@ export const REMOTE_BRIDGE_SERVICE_WHITELIST: readonly ServiceDescriptor<unknown
   IZCodeAgentService,
   IZCodeSessionService,
   IZCodeTaskService,
+  IWindowControllerService,
   IFileService,
   ITerminalService,
   IBroadcastService,
@@ -113,6 +125,8 @@ export const REMOTE_BRIDGE_SERVICE_WHITELIST: readonly ServiceDescriptor<unknown
   IOAuthService,
   IProviderSettingsService,
   ICredentialService,
+  IUsageStatsService,
+  ICodingPlanSubscriptionService,
 ];
 
 /**
@@ -132,6 +146,7 @@ const REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES: readonly string[] = [
   IZCodeAgentService.channelName,
   IZCodeSessionService.channelName,
   IZCodeTaskService.channelName,
+  IWindowControllerService.channelName,
   IFileService.channelName,
   ITerminalService.channelName,
   IBroadcastService.channelName,
@@ -581,6 +596,123 @@ export function createReadOnlyCredentialService(service: ICredentialService): IC
   });
 }
 
+// ── usage-stats：用量只读（设备侧代取：真凭据只在设备侧用于调供应商统计接口）──
+
+/**
+ * IUsageStatsService 的只读包装。放行 5 个读：getAppUsageSnapshot / getCodingPlanUsageSnapshot
+ * / getCodingPlanResetStatus / getSnapshot / getEntitlementSnapshot。响应字段审计
+ * （shared/src/usage-stats.ts + usage-quota.ts + coding-plan-reset.ts）：全部是用量数字、
+ * 日期、model/tool 代号、quota 桶（planId/usage/remaining/nextResetTime）与
+ * subscription.identityMasked（按设计即脱敏的账号标识）——无 token/key/secret 样字段，
+ * 不需要逐字段剥除。请求侧 accountAccess（zcodeAccountAccessSchema）只携带 plan 上下文
+ * 标识（family/planKind/productId/organizationId），凭据解析完全发生在设备侧——这正是
+ * 「设备侧代取」模式：网页只需要统计结果，永远不需要真 key。
+ * 拒绝 3 个：useCodingPlanReset / requestCodingPlanResetOpportunity（供应商侧重置动作，
+ * 远控不做）/ markCodingPlanResetHistoryRead（写已读状态）。抛错而不是假数据，原版 UI
+ * 的失败分支自然生效（重置入口远端不可用是文档化取舍）。
+ */
+export function createReadOnlyUsageStatsService(service: IUsageStatsService): IUsageStatsService {
+  return markRedacted<IUsageStatsService>({
+    getAppUsageSnapshot: (request) =>
+      readThroughSanitized(() => service.getAppUsageSnapshot(request)),
+    getCodingPlanUsageSnapshot: (request) =>
+      readThroughSanitized(() => service.getCodingPlanUsageSnapshot(request)),
+    getCodingPlanResetStatus: (request) =>
+      readThroughSanitized(() => service.getCodingPlanResetStatus(request)),
+    getSnapshot: (request) => readThroughSanitized(() => service.getSnapshot(request)),
+    getEntitlementSnapshot: (request) =>
+      readThroughSanitized(() => service.getEntitlementSnapshot(request)),
+    requestCodingPlanResetOpportunity: () =>
+      rejectRemoteChannelMethod("usage-stats", "requestCodingPlanResetOpportunity"),
+    useCodingPlanReset: () => rejectRemoteChannelMethod("usage-stats", "useCodingPlanReset"),
+    markCodingPlanResetHistoryRead: () =>
+      rejectRemoteChannelMethod("usage-stats", "markCodingPlanResetHistoryRead"),
+  });
+}
+
+// ── coding-plan-subscription：订阅读面 + 支付流全拒 ──────────────────────────
+
+/**
+ * 剥离 getOffPeakClientConfig 响应内嵌的 ModelSelectionView 凭据面：与 modelSelection
+ * 通道同一口径（redactModelSelectionView），off-peak 只需要入口曝光开关与模型展示，
+ * 剥 access.{apiKey,apiKeyManagementUrl} 与 api.headers 不影响远控面。
+ */
+export function redactOffPeakClientConfig(config: OffPeakClientConfig): OffPeakClientConfig {
+  const redactedView = redactModelSelectionView(config.modelSelectionView);
+  return redactedView === config.modelSelectionView
+    ? config
+    : { ...config, modelSelectionView: redactedView };
+}
+
+/**
+ * ICodingPlanSubscriptionService 的只读包装（逐方法裁决，全接口 29 成员）。
+ * 放行读 15：batchPreview / getStaticProducts / getStaticTeamProducts /
+ * getStartPlanPreview / getOffPeakClientConfig（响应内嵌 modelSelectionView，剥凭据后放行）
+ * / getDynamicWorkflowClientConfig / getModelContextBudgetStrategy / getForceUpdateConfig
+ * / productInfo / preview / getEnterprisePricing / getEnterpriseBalance /
+ * calculateEnterpriseOrder / getEnterprisePendingOrders / checkEnterpriseOrderStatus——
+ * 均为产品目录/定价/余额/订单状态读（calculateEnterpriseOrder 是纯价格试算，不落单），
+ * 响应类型审计无凭据样字段（Stripe 卡面 paymentMethodId/last4 属 queryStripeCards，
+ * 在拒绝侧）。拒绝 14：createSign / updateSign / checkPayment / checkPendingOrders /
+ * queryStripeCards / bindStripeCard / unbindStripeCard / payStripe / checkPaypalSupport
+ * / createPaypalSetupToken / subscribePaypal / createEnterpriseOrder / cancelEnterpriseOrder
+ * / continueEnterpriseOrderPayment——支付流（签约/绑卡/扣款/下单/续付）远端明确不做，
+ * 抛错让原版 UI 的失败分支自然生效。
+ */
+export function createReadOnlyCodingPlanSubscriptionService(
+  service: ICodingPlanSubscriptionService,
+): ICodingPlanSubscriptionService {
+  return markRedacted<ICodingPlanSubscriptionService>({
+    batchPreview: (request) => readThroughSanitized(() => service.batchPreview(request)),
+    getStaticProducts: () => readThroughSanitized(() => service.getStaticProducts()),
+    getStaticTeamProducts: () => readThroughSanitized(() => service.getStaticTeamProducts()),
+    getStartPlanPreview: () => readThroughSanitized(() => service.getStartPlanPreview()),
+    getOffPeakClientConfig: async (options) =>
+      redactOffPeakClientConfig(
+        await readThroughSanitized(() => service.getOffPeakClientConfig(options)),
+      ),
+    getDynamicWorkflowClientConfig: (options) =>
+      readThroughSanitized(() => service.getDynamicWorkflowClientConfig(options)),
+    getModelContextBudgetStrategy: () =>
+      readThroughSanitized(() => service.getModelContextBudgetStrategy()),
+    getForceUpdateConfig: () => readThroughSanitized(() => service.getForceUpdateConfig()),
+    productInfo: (request) => readThroughSanitized(() => service.productInfo(request)),
+    preview: (request) => readThroughSanitized(() => service.preview(request)),
+    getEnterprisePricing: (request) =>
+      readThroughSanitized(() => service.getEnterprisePricing(request)),
+    getEnterpriseBalance: () => readThroughSanitized(() => service.getEnterpriseBalance()),
+    calculateEnterpriseOrder: (request) =>
+      readThroughSanitized(() => service.calculateEnterpriseOrder(request)),
+    getEnterprisePendingOrders: () =>
+      readThroughSanitized(() => service.getEnterprisePendingOrders()),
+    checkEnterpriseOrderStatus: (request) =>
+      readThroughSanitized(() => service.checkEnterpriseOrderStatus(request)),
+    createSign: () => rejectRemoteChannelMethod("coding-plan-subscription", "createSign"),
+    updateSign: () => rejectRemoteChannelMethod("coding-plan-subscription", "updateSign"),
+    checkPayment: () => rejectRemoteChannelMethod("coding-plan-subscription", "checkPayment"),
+    checkPendingOrders: () =>
+      rejectRemoteChannelMethod("coding-plan-subscription", "checkPendingOrders"),
+    queryStripeCards: () =>
+      rejectRemoteChannelMethod("coding-plan-subscription", "queryStripeCards"),
+    bindStripeCard: () => rejectRemoteChannelMethod("coding-plan-subscription", "bindStripeCard"),
+    unbindStripeCard: () =>
+      rejectRemoteChannelMethod("coding-plan-subscription", "unbindStripeCard"),
+    payStripe: () => rejectRemoteChannelMethod("coding-plan-subscription", "payStripe"),
+    checkPaypalSupport: () =>
+      rejectRemoteChannelMethod("coding-plan-subscription", "checkPaypalSupport"),
+    createPaypalSetupToken: () =>
+      rejectRemoteChannelMethod("coding-plan-subscription", "createPaypalSetupToken"),
+    subscribePaypal: () =>
+      rejectRemoteChannelMethod("coding-plan-subscription", "subscribePaypal"),
+    createEnterpriseOrder: () =>
+      rejectRemoteChannelMethod("coding-plan-subscription", "createEnterpriseOrder"),
+    cancelEnterpriseOrder: () =>
+      rejectRemoteChannelMethod("coding-plan-subscription", "cancelEnterpriseOrder"),
+    continueEnterpriseOrderPayment: () =>
+      rejectRemoteChannelMethod("coding-plan-subscription", "continueEnterpriseOrderPayment"),
+  });
+}
+
 /** wrapped-only 通道注册表：descriptor 只用来取实例与 channel 名，包装工厂是唯一产物来源。 */
 interface RemoteBridgeRedactedChannelRegistration {
   readonly descriptor: ServiceDescriptor<object>;
@@ -607,6 +739,8 @@ const REMOTE_BRIDGE_REDACTED_CHANNELS: readonly RemoteBridgeRedactedChannelRegis
   defineRedactedChannel(IOAuthService, createReadOnlyOAuthService),
   defineRedactedChannel(IProviderSettingsService, createRedactedProviderSettingsService),
   defineRedactedChannel(ICredentialService, createReadOnlyCredentialService),
+  defineRedactedChannel(IUsageStatsService, createReadOnlyUsageStatsService),
+  defineRedactedChannel(ICodingPlanSubscriptionService, createReadOnlyCodingPlanSubscriptionService),
 ];
 
 /**
@@ -639,6 +773,18 @@ function registerRawChannel(server: ChannelServer, channelName: string, instance
     );
   }
   server.registerChannel(channelName, ProxyChannel.fromService(instance));
+}
+
+/**
+ * window-controller attachment 的 RPC 面裁剪：dispose 是设备侧生命周期钩子（随桥连接
+ * 销毁），不属于远端可调用的成员——留在面上等于让任一网页客户端一条 dispose 调用拆掉
+ * 本连接的任务列表订阅。剥离后经 raw 入口注册，其余 7 个接口成员全放行。
+ */
+export function createWindowControllerRpcSurface(
+  attachment: IWindowControllerService & { dispose(): void },
+): IWindowControllerService {
+  const { ["dispose"]: _dispose, ...rpcSurface } = attachment;
+  return rpcSurface;
 }
 
 // ── ws → ISocket 适配（与 server/src/http.ts wrapWebSocket 同形，客户端方向）──
@@ -766,6 +912,13 @@ export async function startRemoteBridge(options: {
   services: ServiceCollection;
   deviceMid?: string;
   logger: RemoteBridgeLogger;
+  /**
+   * window-controller 的每连接实例工厂：传 windowHostControllerRuntime.createAttachmentService
+   * （帧 emitter + Controller 订阅随返回实例 dispose 销毁）。每次调用必须返回全新实例——
+   * 桥按连接注册/销毁，实例复用会让上一条连接的订阅泄漏进下一条。缺失时该通道跳过
+   * （fail-soft，与其余缺服务同语义）。
+   */
+  createWindowControllerService?: () => IWindowControllerService & { dispose(): void };
 }): Promise<RemoteBridgeHandle> {
   assertWhitelistExcludesForbiddenServices();
   const log = options.logger;
@@ -797,18 +950,29 @@ export async function startRemoteBridge(options: {
   let attempt = 0;
   /** 当前连接专属的 agent connection scopes（随连接销毁）。 */
   let agentScopes: Array<{ dispose(): Promise<void> }> = [];
+  /** 当前连接专属的 window-controller attachments（帧 emitter+订阅，随连接销毁）。 */
+  let windowControllerAttachments: Array<{ dispose(): void }> = [];
 
   const teardownConnection = async (): Promise<void> => {
     const current = connection;
     connection = null;
     const scopes = agentScopes;
     agentScopes = [];
+    const attachments = windowControllerAttachments;
+    windowControllerAttachments = [];
     if (!current) {
       for (const scope of scopes) {
         try {
           await scope.dispose();
         } catch {
           // scope dispose 失败不影响收口。
+        }
+      }
+      for (const attachment of attachments) {
+        try {
+          attachment.dispose();
+        } catch {
+          // attachment dispose 失败不影响收口。
         }
       }
       return;
@@ -826,6 +990,13 @@ export async function startRemoteBridge(options: {
     for (const scope of scopes) {
       try {
         await scope.dispose();
+      } catch {
+        // 同上。
+      }
+    }
+    for (const attachment of attachments) {
+      try {
+        attachment.dispose();
       } catch {
         // 同上。
       }
@@ -850,6 +1021,25 @@ export async function startRemoteBridge(options: {
       ]),
     );
     for (const descriptor of REMOTE_BRIDGE_SERVICE_WHITELIST) {
+      // window-controller：raw 裁决成员的连接期编排特例（非脱敏包装）。实例不来自
+      // services 集合——每连接经工厂建独立 attachment（帧 emitter + Controller 订阅），
+      // 挂进 windowControllerAttachments 随连接销毁；RPC 面经
+      // createWindowControllerRpcSurface 剥离设备侧 dispose 钩子后注册。
+      if (descriptor === IWindowControllerService) {
+        const createAttachment = options.createWindowControllerService;
+        if (!createAttachment) {
+          log.warn(`[remote-bridge] service unavailable, skip channel: ${descriptor.channelName}`);
+          continue;
+        }
+        const attachment = createAttachment();
+        windowControllerAttachments.push(attachment);
+        registerRawChannel(
+          server,
+          descriptor.channelName,
+          createWindowControllerRpcSurface(attachment),
+        );
+        continue;
+      }
       const instance = options.services.getOptional(descriptor as ServiceDescriptor<object>);
       if (!instance) {
         log.warn(`[remote-bridge] service unavailable, skip channel: ${descriptor.channelName}`);
