@@ -12,21 +12,26 @@
  *   → 断线后抖动退避重连（full jitter，防雷群）；relay 重启自愈由此获得。
  *
  * ── 安全边界（对抗审查硬验收项，DESIGN §3-3 / §7）──────────────────────────────
- * 1. `REMOTE_BRIDGE_SERVICE_WHITELIST` + `REMOTE_BRIDGE_REDACTED_CHANNELS` +
- *    `registerWhitelistedChannels` 是【唯一】注册面：向 channel 注册的服务只有 K2
- *    定案的最小集。ICredentialService / IProviderProvisioningTargetService 双侧硬禁
- *    （`assertWhitelistExcludesForbiddenServices` 启动即校验）；IOAuthService /
- *    IProviderSettingsService 不允许 raw 注册，只允许经各自的只读脱敏包装进入
- *    （`REMOTE_BRIDGE_REDACTED_CHANNELS` → `registerRedactedChannel` brand 校验，
- *    raw 实例缺包装标记=注册即 fail）。
- * 2. IModelSelectionService / IProviderSettingsService 必须经各自 redaction 包装：
- *    view 的 providers[*].config 携带两类凭据——access 的明文 apiKey/apiKeyManagementUrl
- *    与 api.headers 的 header 型凭据（Authorization 等，provider/src/resolver.ts
- *    serializeRegistryProviderConfig 直传），响应一律 strip（见 redactModelSelectionView /
- *    redactProviderSettingsView）后才出设备。IOAuthService 只放读侧（登录态展示），
- *    OAuth flow/登出/刷新全部拒绝。
+ * 1. `REMOTE_BRIDGE_SERVICE_WHITELIST` + `registerWhitelistedChannels` 是【唯一】注册面，
+ *    且每个成员必须显式裁决为 wrapped 或 raw（`assertWhitelistExcludesForbiddenServices`
+ *    启动即校验的结构化裁决，新服务入桥必须二选一并落表）：
+ *    - credential / provider-provisioning-target 永不放行（双侧硬禁）；
+ *    - IOAuthService / IProviderSettingsService / IModelSelectionService 是 wrapped-only：
+ *      只能经 `REMOTE_BRIDGE_REDACTED_CHANNELS` 的脱敏包装注册，`registerRedactedChannel`
+ *      的 brand 校验让 raw 实例注册即 fail。
+ * 2. wrapped 通道的读面约束：modelSelection/provider-settings 的 view 携带两类凭据——
+ *    access 的明文 apiKey/apiKeyManagementUrl 与 api.headers 的 header 型凭据
+ *    （provider/src/resolver.ts serializeRegistryProviderConfig 直传），响应与
+ *    onDidChange 事件一律 strip 后才出设备（redactModelSelectionView /
+ *    redactProviderSettingsView）；oauth 只放观察读（登录展示态经设备侧
+ *    peekCachedSessionState 无副作用合成，见 createReadOnlyOAuthService）。
+ *    读侧直通错误一律消毒（丢 stack/passthrough 字段，见 sanitizeRemoteReadError）。
  * 3. 本模块绝不使用 ServiceCollection.exposeOnChannelServer（全量无差别暴露，
  *    services/src/collection.ts:34-40）。
+ * 4. 双层信任模型（security review Major 1）：host 包装是第一道（脱敏/只读，防本设备
+ *    凭据出网）；relay 对 oauth/provider-settings 的方法级过滤是第二道
+ *    （server/src/relay.ts RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS，防共享 enroll token
+ *    的冒充主机注册 raw 服务后经原版 UI 写路径收割凭据）。两道各自独立生效。
  */
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -51,6 +56,7 @@ import {
   IZCodeSessionService,
   IZCodeTaskService,
   createZCodeAgentConnectionScope,
+  type ProviderSettingsView,
   type ServiceCollection,
   type ServiceDescriptor,
 } from "@zcode/services";
@@ -79,65 +85,103 @@ interface RemoteBridgeLogger {
 }
 
 /**
- * K2 定案的必需服务最小集（DESIGN §5-K2 + 本任务复核）：
+ * K2 定案的桥上通道总清单（DESIGN §5-K2 + 本任务复核）：
  * - ISettingService：web bootstrap 全链（IntlProvider/useSettings/tab 恢复/providerFamilyDomain 迁移）。
- * - IModelSelectionService：composer 发送硬门禁（经 apiKey-redaction 包装，见文件头）。
- * - IZCodeAgentService：V4 会话命令通道（sendConversationCommandV4）。
+ * - IZCodeAgentService：V4 会话命令通道（sendConversationCommandV4，raw + 连接期 scope）。
  * - IZCodeSessionService / IZCodeTaskService：会话读取/状态与任务列表/元数据。
  * - IFileService / ITerminalService：文件树/附件兜底 + 终端面板（K3 硬验收项）。
  * - IBroadcastService：缺=纯降级但零风险，StoreProvider/IntlProvider 语义前提。
- * IGitService / ISystemService 未入 K2 最小集（缺=降级不挂，K2 实测），保持排除收窄审查面。
- * oauth / provider-settings 不在主表：它们是 wrapped-only 通道，见 REMOTE_BRIDGE_REDACTED_CHANNELS。
+ * - IModelSelectionService / IOAuthService / IProviderSettingsService：wrapped-only（见下）。
+ * IGitService / ISystemService 未入（缺=降级不挂，K2 实测），保持排除收窄审查面。
+ * 每个成员必须落在 REMOTE_BRIDGE_REDACTED_CHANNELS（wrapped）或
+ * REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES（raw）之一，否则启动即 fail——新服务入桥
+ * 必须显式裁决（security review Note 6：不再依赖注册函数里的运行时特例分支）。
  */
 export const REMOTE_BRIDGE_SERVICE_WHITELIST: readonly ServiceDescriptor<unknown>[] = [
   ISettingService,
-  IModelSelectionService,
   IZCodeAgentService,
   IZCodeSessionService,
   IZCodeTaskService,
   IFileService,
   ITerminalService,
   IBroadcastService,
+  IModelSelectionService,
+  IOAuthService,
+  IProviderSettingsService,
 ];
 
 /**
- * 凭据邻接服务的 channelName 镜像清单（shared/src/channels.ts ServiceChannels）：
- * ICredentialService / IOAuthService / IProviderProvisioningTargetService / IProviderSettingsService。
- * 用字符串镜像而非 import 描述符，防止“顺手加回来”式回归。语义是【raw 注册禁入】：
- * credential / provider-provisioning-target 永不放行（双侧硬禁）；oauth /
- * provider-settings 只允许经 REMOTE_BRIDGE_REDACTED_CHANNELS 的脱敏包装注册，
- * raw 实例同样进不了这张主表。与 server/src/relay.ts
- * RELAY_FORBIDDEN_DEVICE_SERVICES（credential/provisioning-target）互为两侧双保险；
- * oauth/provider-settings 的脱敏保证在 host 侧结构化强制（见 registerRedactedChannel），
- * relay 不再重复拦这两个通道。
+ * 永不放行的凭据邻接通道（双侧硬禁，任何注册形态都不允许）：
+ * credential / provider-provisioning-target。channelName 用字符串镜像（shared/src/
+ * channels.ts ServiceChannels）而非 import 描述符，防止“顺手加回来”式回归；
+ * 与 server/src/relay.ts RELAY_FORBIDDEN_DEVICE_SERVICES 互为两侧双保险。
+ * oauth / provider-settings 属于 wrapped-only：允许出现在主清单，但只能经
+ * REMOTE_BRIDGE_REDACTED_CHANNELS 的脱敏包装注册（裁决断言 + brand 校验双层强制）。
  */
 const REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES: readonly string[] = [
   "credential",
-  "oauth",
   "provider-provisioning-target",
-  "provider-settings",
 ];
+
+/** raw 直注册显式允许清单：不在此列且非 wrapped 的主清单成员会让启动 fail。 */
+const REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES: readonly string[] = [
+  ISettingService.channelName,
+  IZCodeAgentService.channelName,
+  IZCodeSessionService.channelName,
+  IZCodeTaskService.channelName,
+  IFileService.channelName,
+  ITerminalService.channelName,
+  IBroadcastService.channelName,
+];
+
+/** 单个通道名的裁决结果（assertWhitelistExcludesForbiddenServices 的结构化依据）。 */
+export type RemoteBridgeChannelRuling = "wrapped" | "raw" | "forbidden" | "unruled";
+
+/**
+ * 查询通道裁决：wrapped=必须经脱敏包装注册；raw=允许直注册（显式清单）；
+ * forbidden=永不放行；unruled=主清单出现该名字时启动即 fail。
+ * 导出供启动断言与对抗审查测试复用。
+ */
+export function resolveRemoteBridgeChannelRuling(channelName: string): RemoteBridgeChannelRuling {
+  if (REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES.includes(channelName)) {
+    return "forbidden";
+  }
+  if (
+    REMOTE_BRIDGE_REDACTED_CHANNELS.some((entry) => entry.descriptor.channelName === channelName)
+  ) {
+    return "wrapped";
+  }
+  if (REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES.includes(channelName)) {
+    return "raw";
+  }
+  return "unruled";
+}
 
 function assertWhitelistExcludesForbiddenServices(): void {
   const names = REMOTE_BRIDGE_SERVICE_WHITELIST.map((descriptor) => descriptor.channelName);
-  for (const forbidden of REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES) {
-    if (names.includes(forbidden)) {
+  if (new Set(names).size !== names.length) {
+    throw new Error("Remote bridge whitelist must have unique channel names");
+  }
+  for (const name of names) {
+    const ruling = resolveRemoteBridgeChannelRuling(name);
+    if (ruling === "forbidden") {
       throw new Error(
-        `Remote bridge whitelist must not include credential-adjacent service: ${forbidden}`,
+        `Remote bridge whitelist must not include credential-adjacent service: ${name}`,
+      );
+    }
+    if (ruling === "unruled") {
+      throw new Error(
+        `Remote bridge channel '${name}' has no explicit wrapped/raw ruling; wrap it via REMOTE_BRIDGE_REDACTED_CHANNELS or add an explicit raw allowance`,
       );
     }
   }
-  const redactedNames = REMOTE_BRIDGE_REDACTED_CHANNELS.map(
-    (entry) => entry.descriptor.channelName,
-  );
-  for (const name of redactedNames) {
-    // wrapped-only 通道名混进 raw 主表 = raw 注册路径可达，必须在启动时暴露。
-    if (names.includes(name)) {
-      throw new Error(`Remote bridge raw whitelist overlaps redacted channel: ${name}`);
+  // wrapped 与 raw 二选一：同名列在两张表=两条注册路径并存，brand 强制被绕开的口子。
+  for (const entry of REMOTE_BRIDGE_REDACTED_CHANNELS) {
+    if (REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES.includes(entry.descriptor.channelName)) {
+      throw new Error(
+        `Remote bridge channel '${entry.descriptor.channelName}' is ruled both wrapped and raw`,
+      );
     }
-  }
-  if (new Set(redactedNames).size !== redactedNames.length) {
-    throw new Error("Remote bridge redacted channels must have unique channel names");
   }
 }
 
@@ -206,9 +250,9 @@ export function createRedactedModelSelectionService(
   });
 }
 
-// ── wrapped-only 通道注册（oauth / provider-settings 的结构化强制）────────────
+// ── wrapped-only 通道注册（modelSelection / oauth / provider-settings 的结构化强制）──
 //
-// 这两个通道名不允许 raw 注册：唯一注册入口 registerRedactedChannel 校验实例带
+// 这些通道名不允许 raw 注册：唯一注册入口 registerRedactedChannel 校验实例带
 // REMOTE_BRIDGE_REDACTED_BRAND（只有本文件的包装工厂会打标），raw 服务直接注册
 // 在启动/重连注册时即 fail。原版 web UI 的 ProxyChannel 按 channel name 取服务，
 // 所以通道名必须与 shared ServiceChannels 完全一致（UI 代码零改动的前提）。
@@ -237,21 +281,53 @@ function rejectRemoteChannelMethod(channel: string, method: string): never {
 }
 
 /**
- * IOAuthService 的只读包装：只放登录态展示读侧。
+ * 读侧直通错误消毒（security review Minor 3）：ChannelServer 会把 error.stack 与
+ * code/data/detail 等 passthrough 字段全量序列化回客户端，底层错误的堆栈会携带
+ * 设备路径/模块布局。这里保留 message、丢掉 stack 与全部附带字段后 rethrow；
+ * 通用序列化路径（rpc/channelServer.ts）不动。
+ */
+function sanitizeRemoteReadError(error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error);
+  const sanitized = new Error(message);
+  sanitized.stack = undefined;
+  throw sanitized;
+}
+
+/** 读侧透传 + 消毒：成功值原样返回，底层错误换成本地构造的简明 Error。 */
+async function readThroughSanitized<T>(read: () => Promise<T>): Promise<T> {
+  try {
+    return await read();
+  } catch (error) {
+    sanitizeRemoteReadError(error);
+  }
+}
+
+/**
+ * IOAuthService 的只读观察包装（security review Major 2）。
+ * 远控面 oauth 是观察视角：不做会话校验，更不触发设备端任何登录态写副作用——
+ * 底层 restoreCachedSessionState/restoreSession 在 token 缺失/401/403/JWT 过期分支
+ * 会 logout（clearActiveSession + 派生 provider key 删除），成功路径还有迁移写回，
+ * 因此这里绝不调用它们；登录展示态经设备侧 peekCachedSessionState（纯读，解密失败
+ * 按未登录处理，见 services oauthCredentialRepo.peekActiveSession）dry 合成：
+ * authenticated/signed-out 两种形状，永不返回 reauthentication-required（触发它会
+ * 把远端用户锁进无法在本机完成的重新认证流）。
  * 读侧返回值形状复核（shared/src/oauth.ts）：UserInfo={id,username,displayName,avatarUrl?}、
- * OAuthProviderMeta={id,displayName,enabled,order}、OAuthCachedSessionRestoreResult 只包
- * userInfo/状态分支——均无 token/secret 字段（services/src/oauth/oauthService.ts toUserInfo
- * 只投影这四个展示字段），无需二次剥离。
- * 写侧（OAuth flow/回调/轮询/刷新/登出/取消）全部抛错——远控面不得改动设备登录态，
- * 抛错而不是假数据，让原版 UI 的失败分支自然生效。
+ * OAuthProviderMeta={id,displayName,enabled,order}——均无 token/secret 字段。
+ * 写侧（OAuth flow/回调/轮询/刷新/登出/取消）全部抛错，抛错而不是假数据，
+ * 让原版 UI 的失败分支自然生效。restoreSession 同样抛错：UI 无调用点
+ * （packages/ui 全量 grep 仅 restoreCachedSessionState/getActiveProvider/getProviders）。
  */
 export function createReadOnlyOAuthService(service: IOAuthService): IOAuthService {
   return markRedacted<IOAuthService>({
-    getProviders: () => service.getProviders(),
-    getActiveProvider: () => service.getActiveProvider(),
-    restoreCachedSession: () => service.restoreCachedSession(),
-    restoreCachedSessionState: () => service.restoreCachedSessionState(),
-    restoreSession: () => service.restoreSession(),
+    getProviders: () => readThroughSanitized(() => service.getProviders()),
+    getActiveProvider: () => readThroughSanitized(() => service.getActiveProvider()),
+    restoreCachedSessionState: () => readThroughSanitized(() => service.peekCachedSessionState()),
+    restoreCachedSession: async () => {
+      const state = await readThroughSanitized(() => service.peekCachedSessionState());
+      return state.status === "authenticated" ? state.userInfo : null;
+    },
+    restoreSession: () => rejectRemoteChannelMethod("oauth", "restoreSession"),
+    peekCachedSessionState: () => rejectRemoteChannelMethod("oauth", "peekCachedSessionState"),
     startOAuth: () => rejectRemoteChannelMethod("oauth", "startOAuth"),
     startOAuthWithPolling: () => rejectRemoteChannelMethod("oauth", "startOAuthWithPolling"),
     pollPendingOAuth: () => rejectRemoteChannelMethod("oauth", "pollPendingOAuth"),
@@ -292,11 +368,22 @@ const PROVIDER_SETTINGS_REDACTED_CONFIG_FIELDS = [
 ] as const;
 
 /**
+ * refresh 限频（security review Minor 5）：refresh 会触发设备上游配置源重读
+ * （egress/配额消耗），web 侧不能无限循环调用。包装实例随桥连接创建/销毁，
+ * 实例内窗口即“每连接”窗口。
+ */
+const PROVIDER_SETTINGS_REFRESH_MAX_CALLS_PER_WINDOW = 6;
+const PROVIDER_SETTINGS_REFRESH_WINDOW_MS = 60_000;
+
+/**
  * 剥离 ProviderSettingsView 的凭据面：providers[*].{personalConfig,effectiveConfig,
  * effectiveBuiltinConfig} 与 providerTemplates[*].config（均为 ProviderConfigObject）。
  * 手法与 redactModelSelectionView 一致：只沿需要改写的路径浅拷贝，未知形状原样放过；
  * accountState（AccountProviderState）已复核只含 availability/entitled/connectionKey 等
  * 非凭据字段（provider/src/account-provider-state.ts 自述“不包含凭据”），不剥。
+ * 已知残留面（security review Minor 4，文档化不剥）：api.baseUrl 理论上可内嵌
+ * query 形式的 key（如 ?api-key=…），但按字段名剥除会误伤全部合法 URL——与
+ * redactModelSelectionView 对 modelSelection 的取舍一致，接受该残留。
  */
 export function redactProviderSettingsView<
   View extends { providers?: unknown; providerTemplates?: unknown },
@@ -354,16 +441,46 @@ export function redactProviderSettingsView<
 }
 
 /**
- * IProviderSettingsService 的只读脱敏包装：getView/refresh 响应与 onDidChange 事件全部
- * 过滤；全部 mutation（含 resolveModelConfig/testModelConnectivity 这类编辑器辅助流）
- * 一律抛错——远控面是只读观察，不是第二套配置编辑入口。
+ * IProviderSettingsService 的只读脱敏包装：getView/refresh 响应与 onDidChange 事件
+ * 全部过滤，读侧直通错误消毒（丢设备堆栈）；refresh 有限频（见下方常量），超限回放
+ * 最近一次成功 view 而不是报错——原版 UI 的刷新流是读侧自动重试语义，报错会炸
+ * toast，回放的是设备已认可的真实快照（脱敏后），不构成假数据；连一次成功快照都
+ * 还没有时才抛明确错误。全部 mutation（含 resolveModelConfig/testModelConnectivity
+ * 这类编辑器辅助流）一律抛错——远控面是只读观察，不是第二套配置编辑入口。
  */
 export function createRedactedProviderSettingsService(
   service: IProviderSettingsService,
 ): IProviderSettingsService {
+  let refreshCallTimestamps: number[] = [];
+  let lastRedactedView: ProviderSettingsView | null = null;
+  const getView = async (): Promise<ProviderSettingsView> => {
+    const view = redactProviderSettingsView(await readThroughSanitized(() => service.getView()));
+    lastRedactedView = view;
+    return view;
+  };
+  const refresh = async (reason: string): Promise<ProviderSettingsView> => {
+    const now = Date.now();
+    refreshCallTimestamps = refreshCallTimestamps.filter(
+      (timestamp) => now - timestamp < PROVIDER_SETTINGS_REFRESH_WINDOW_MS,
+    );
+    if (refreshCallTimestamps.length >= PROVIDER_SETTINGS_REFRESH_MAX_CALLS_PER_WINDOW) {
+      if (lastRedactedView) {
+        return lastRedactedView;
+      }
+      throw new Error(
+        "provider-settings.refresh is rate limited on the remote bridge; retry later",
+      );
+    }
+    refreshCallTimestamps.push(now);
+    const view = redactProviderSettingsView(
+      await readThroughSanitized(() => service.refresh(reason)),
+    );
+    lastRedactedView = view;
+    return view;
+  };
   return markRedacted<IProviderSettingsService>({
-    getView: async () => redactProviderSettingsView(await service.getView()),
-    refresh: async (reason) => redactProviderSettingsView(await service.refresh(reason)),
+    getView,
+    refresh,
     onDidChange: (listener) =>
       service.onDidChange((view) => {
         listener(redactProviderSettingsView(view));
@@ -411,10 +528,11 @@ function defineRedactedChannel<T>(
 }
 
 /**
- * oauth / provider-settings 的注册表（原版 web UI 按 channel name 消费这两个通道）。
- * 每条 = 描述符 + 脱敏包装工厂；raw 实例没有入口（见文件头安全边界第 1 条）。
+ * wrapped-only 通道注册表（原版 web UI 按 channel name 消费这些通道）。
+ * 每条 = 描述符 + 脱敏/只读包装工厂；raw 实例没有入口（见文件头安全边界第 1 条）。
  */
 const REMOTE_BRIDGE_REDACTED_CHANNELS: readonly RemoteBridgeRedactedChannelRegistration[] = [
+  defineRedactedChannel(IModelSelectionService, createRedactedModelSelectionService),
   defineRedactedChannel(IOAuthService, createReadOnlyOAuthService),
   defineRedactedChannel(IProviderSettingsService, createRedactedProviderSettingsService),
 ];
@@ -424,7 +542,7 @@ const REMOTE_BRIDGE_REDACTED_CHANNELS: readonly RemoteBridgeRedactedChannelRegis
  * 脱敏工厂会打标）。raw IOAuthService/IProviderSettingsService 流入这里会在注册时
  * 立即 throw——桥按连接注册，等价于启动即 fail。
  */
-function registerRedactedChannel(
+export function registerRedactedChannel(
   server: ChannelServer,
   channelName: string,
   wrappedService: object,
@@ -435,6 +553,20 @@ function registerRedactedChannel(
     );
   }
   server.registerChannel(channelName, ProxyChannel.fromService(wrappedService));
+}
+
+/**
+ * raw 直注册的唯一入口：通道名必须在 REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES 显式
+ * 清单内，否则注册即 throw。与 registerRedactedChannel 对称——wrapped/raw 两条注册
+ * 路径各自有入口级强制，绕过任何一张裁决表都会在这里暴露。
+ */
+function registerRawChannel(server: ChannelServer, channelName: string, instance: object): void {
+  if (!REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES.includes(channelName)) {
+    throw new Error(
+      `Remote bridge channel '${channelName}' has no explicit raw allowance; register it via a redaction wrapper or extend the raw allowance list`,
+    );
+  }
+  server.registerChannel(channelName, ProxyChannel.fromService(instance));
 }
 
 // ── ws → ISocket 适配（与 server/src/http.ts wrapWebSocket 同形，客户端方向）──
@@ -635,35 +767,33 @@ export async function startRemoteBridge(options: {
   };
 
   // ── 白名单注册面（唯一，对抗审查焦点）────────────────────────────────────
-  // raw 主表只注册 REMOTE_BRIDGE_SERVICE_WHITELIST；oauth / provider-settings 走
-  // REMOTE_BRIDGE_REDACTED_CHANNELS 的包装工厂 + registerRedactedChannel（brand 校验）。
   // 逐条 getOptional，缺失服务跳过并 warn（fail-soft：少一个服务不炸整条桥，
-  // 对应 K2 失败模式表的“缺=降级”）。
+  // 对应 K2 失败模式表的“缺=降级”）。wrapped/raw 裁决由启动断言保证与
+  // REMOTE_BRIDGE_SERVICE_WHITELIST 一致；这里按裁决分派，不存在未裁决分支。
   const registerWhitelistedChannels = (server: ChannelServer): void => {
+    const wrappedFactoryByChannelName = new Map(
+      REMOTE_BRIDGE_REDACTED_CHANNELS.map((entry) => [
+        entry.descriptor.channelName,
+        entry.createWrapped,
+      ]),
+    );
     for (const descriptor of REMOTE_BRIDGE_SERVICE_WHITELIST) {
-      if (descriptor === IModelSelectionService) {
-        const service = options.services.getOptional(IModelSelectionService);
-        if (!service) {
-          log.warn(`[remote-bridge] service unavailable, skip channel: ${descriptor.channelName}`);
-          continue;
-        }
-        registerRedactedChannel(
-          server,
-          descriptor.channelName,
-          createRedactedModelSelectionService(service),
-        );
+      const instance = options.services.getOptional(descriptor as ServiceDescriptor<object>);
+      if (!instance) {
+        log.warn(`[remote-bridge] service unavailable, skip channel: ${descriptor.channelName}`);
+        continue;
+      }
+      const createWrapped = wrappedFactoryByChannelName.get(descriptor.channelName);
+      if (createWrapped) {
+        registerRedactedChannel(server, descriptor.channelName, createWrapped(instance));
         continue;
       }
       if (descriptor === IZCodeAgentService) {
-        const service = options.services.getOptional(IZCodeAgentService);
-        if (!service) {
-          log.warn(`[remote-bridge] service unavailable, skip channel: ${descriptor.channelName}`);
-          continue;
-        }
         // 中继是 enroll-token 门后的 trusted host relay：连接期 facade 用
         // trusted-host-relay（身份选择在 transport 层完成，V4 hello 由下游 web 客户端
         // 经 trusted 字段透传），与 server/src/http.ts desktop-continuous 路径同构。
-        const scope = createZCodeAgentConnectionScope(service, {
+        // （raw 裁决成员的连接期编排特例，非脱敏包装。）
+        const scope = createZCodeAgentConnectionScope(instance as IZCodeAgentService, {
           connectionId: `remote-bridge-${randomUUID()}`,
           clientMode: "desktop-continuous",
           role: "trusted-host-relay",
@@ -685,20 +815,7 @@ export async function startRemoteBridge(options: {
         );
         continue;
       }
-      const instance = options.services.getOptional(descriptor as ServiceDescriptor<object>);
-      if (!instance) {
-        log.warn(`[remote-bridge] service unavailable, skip channel: ${descriptor.channelName}`);
-        continue;
-      }
-      server.registerChannel(descriptor.channelName, ProxyChannel.fromService(instance));
-    }
-    for (const { descriptor, createWrapped } of REMOTE_BRIDGE_REDACTED_CHANNELS) {
-      const service = options.services.getOptional(descriptor);
-      if (!service) {
-        log.warn(`[remote-bridge] service unavailable, skip channel: ${descriptor.channelName}`);
-        continue;
-      }
-      registerRedactedChannel(server, descriptor.channelName, createWrapped(service));
+      registerRawChannel(server, descriptor.channelName, instance);
     }
   };
 

@@ -28,6 +28,14 @@ export interface IOAuthService {
   /** 恢复本地展示态，并区分从未登录与 JWT 过期后需要重新认证。 */
   restoreCachedSessionState(): Promise<OAuthCachedSessionRestoreResult>;
 
+  /**
+   * 只读观察当前缓存的登录展示态（远控桥视角）：不做远端 token 校验，也不触发
+   * restoreCachedSessionState 的任何写副作用（失效清理/active provider 纠偏/legacy
+   * 迁移写回）。凭据解密失败按未登录展示而不是清除会话；JWT 缺失/过期同样只按
+   * 未登录展示——失效清理由设备自身启动链路负责，观察方不代办。
+   */
+  peekCachedSessionState(): Promise<OAuthCachedSessionRestoreResult>;
+
   /** 显式校验当前 provider 会话：成功返回用户信息，失败或过期返回 null */
   restoreSession(): Promise<UserInfo | null>;
 

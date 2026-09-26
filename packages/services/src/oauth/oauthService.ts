@@ -5,6 +5,7 @@ import {
   formatLogPrefix,
   type ApiClient,
   BIGMODEL_PROVIDER_ID,
+  isCredentialDecryptError,
   ZAI_PROVIDER_ID,
   type OAuthCallbackResult,
   type OAuthCachedSessionRestoreResult,
@@ -266,6 +267,53 @@ export class OAuthService implements IOAuthService {
 
     log("restoreCachedSession restored:", activeProvider, profile.id);
     return { status: "authenticated", userInfo: toUserInfo(profile) };
+  }
+
+  /**
+   * 只读观察当前缓存登录展示态（远控桥视角，接口契约见 IOAuthService.peekCachedSessionState）。
+   * 与 restoreCachedSessionState 的差异：不经 repo.load*（其解密失败分支会
+   * clearCorruptOAuthSession），只走 peekActiveSession/peekCredentialEntry 的无副作用读；
+   * JWT 门槛沿用 restore 语义但只读判定——缺失/过期按未登录展示，不做任何清理。
+   */
+  async peekCachedSessionState(): Promise<OAuthCachedSessionRestoreResult> {
+    const session = await this.repo.peekActiveSession();
+    if (!session) {
+      log("peekCachedSessionState: no active provider");
+      return { status: "signed-out" };
+    }
+    const adapter = this.adapters.get(session.provider);
+    if (!adapter || !adapter.meta.enabled) {
+      log("peekCachedSessionState: provider unavailable:", session.provider);
+      return { status: "signed-out" };
+    }
+    if (!session.profile) {
+      log("peekCachedSessionState: missing cached user profile:", session.provider);
+      return { status: "signed-out" };
+    }
+    const zcodeJwtToken = await this.peekZCodeJwtToken();
+    if (zcodeJwtToken && resolveJwtExpiration(zcodeJwtToken, this.now()).kind === "expired") {
+      // 观察视角不裁决失效：设备端启动恢复会清理过期会话，这里只按未登录展示，
+      // 让远控面与设备收敛后的事实一致，而不替设备执行清理。
+      log("peekCachedSessionState: zcode JWT expired, displaying signed-out");
+      return { status: "signed-out" };
+    }
+    if (session.provider === ZAI_PROVIDER_ID && !zcodeJwtToken) {
+      log("peekCachedSessionState: missing zcodejwttoken:", session.provider);
+      return { status: "signed-out" };
+    }
+    return { status: "authenticated", userInfo: toUserInfo(session.profile) };
+  }
+
+  /** 观察视角读共享 zcode JWT：解密失败按缺失处理，不走清理。 */
+  private async peekZCodeJwtToken(): Promise<string> {
+    try {
+      return (await this.credentialService.load(ZCODE_JWT_TOKEN_KEY))?.trim() ?? "";
+    } catch (error) {
+      if (!isCredentialDecryptError(error)) {
+        throw error;
+      }
+      return "";
+    }
   }
 
   private async invalidateExpiredCachedSession(

@@ -132,6 +132,44 @@ function toOAuthUserProfileFromRawZaiUser(raw: Record<string, unknown>): OAuthUs
   };
 }
 
+/** 解析持久化的 user_info 条目为展示 profile；无法解析（含 ZAI raw user 映射）返回 null。 */
+function parseStoredUserProfile(raw: string, provider?: OAuthProviderId): OAuthUserProfile | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<OAuthUserProfile>;
+    if (
+      typeof parsed.id === "string" &&
+      typeof parsed.username === "string" &&
+      typeof parsed.displayName === "string"
+    ) {
+      const avatarUrl = typeof parsed.avatarUrl === "string" ? parsed.avatarUrl : undefined;
+      const rawProfile =
+        typeof parsed.rawProfile === "object" && parsed.rawProfile !== null
+          ? parsed.rawProfile
+          : undefined;
+      return {
+        id: parsed.id,
+        username: parsed.username,
+        displayName: parsed.displayName,
+        ...(avatarUrl ? { avatarUrl } : {}),
+        ...(rawProfile ? { rawProfile } : {}),
+      };
+    }
+
+    if (provider === ZAI_PROVIDER_ID && typeof parsed === "object" && parsed !== null) {
+      // ZAI user_info 现在按后端 data.user 原样持久化，
+      // 启动恢复时需要从 user_id/name/avatar 重新映射展示字段。
+      const zaiProfile = toOAuthUserProfileFromRawZaiUser(parsed as Record<string, unknown>);
+      if (zaiProfile) {
+        return zaiProfile;
+      }
+    }
+  } catch {
+    // ignore parse error and fallback to null
+  }
+
+  return null;
+}
+
 /** OAuth 凭据仓储：统一 provider 命名空间 */
 export class OAuthCredentialRepo {
   private readonly knownProviderIds: OAuthProviderId[];
@@ -362,41 +400,40 @@ export class OAuthCredentialRepo {
     if (!raw) {
       return null;
     }
+    return parseStoredUserProfile(raw, provider);
+  }
 
-    try {
-      const parsed = JSON.parse(raw) as Partial<OAuthUserProfile>;
-      if (
-        typeof parsed.id === "string" &&
-        typeof parsed.username === "string" &&
-        typeof parsed.displayName === "string"
-      ) {
-        const avatarUrl = typeof parsed.avatarUrl === "string" ? parsed.avatarUrl : undefined;
-        const rawProfile =
-          typeof parsed.rawProfile === "object" && parsed.rawProfile !== null
-            ? parsed.rawProfile
-            : undefined;
-        return {
-          id: parsed.id,
-          username: parsed.username,
-          displayName: parsed.displayName,
-          ...(avatarUrl ? { avatarUrl } : {}),
-          ...(rawProfile ? { rawProfile } : {}),
-        };
-      }
-
-      if (provider === ZAI_PROVIDER_ID && typeof parsed === "object" && parsed !== null) {
-        // ZAI user_info 现在按后端 data.user 原样持久化，
-        // 启动恢复时需要从 user_id/name/avatar 重新映射展示字段。
-        const zaiProfile = toOAuthUserProfileFromRawZaiUser(parsed as Record<string, unknown>);
-        if (zaiProfile) {
-          return zaiProfile;
-        }
-      }
-    } catch {
-      // ignore parse error and fallback to null
+  /**
+   * 只读观察当前 active provider 与其缓存 user profile（远控桥视角）。
+   * 与 loadActiveProvider/loadActiveUserProfile 的关键差异：凭据解密失败按“无值”
+   * 返回而不是 clearCorruptOAuthSession——观察路径不得销毁设备登录态；损坏态的
+   * 自愈清理仍由设备自身的启动恢复链路（load* 路径）负责。
+   */
+  async peekActiveSession(): Promise<{
+    provider: OAuthProviderId;
+    profile: OAuthUserProfile | null;
+  } | null> {
+    const provider = await this.peekCredentialEntry(ACTIVE_PROVIDER_KEY);
+    if (!provider) {
+      return null;
     }
+    const raw = await this.peekCredentialEntry(userInfoKey(provider));
+    return {
+      provider: provider as OAuthProviderId,
+      profile: raw == null ? null : parseStoredUserProfile(raw, provider as OAuthProviderId),
+    };
+  }
 
-    return null;
+  /** 观察视角读单个凭据项：解密失败返回 null，其余错误原样抛出。 */
+  private async peekCredentialEntry(key: string): Promise<string | null> {
+    try {
+      return await this.credentialService.load(key);
+    } catch (error) {
+      if (!isCredentialDecryptError(error)) {
+        throw error;
+      }
+      return null;
+    }
   }
 
   async saveUserProfile(provider: OAuthProviderId, profile: OAuthUserProfile): Promise<void> {
