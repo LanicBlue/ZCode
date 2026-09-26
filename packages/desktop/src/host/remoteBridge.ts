@@ -458,7 +458,12 @@ export async function startRemoteBridge(options: {
         const capability = await fetchHostCapability(serverUrl, enrollToken);
         if (disposed) return;
         socket = new WebSocket(wsUrl, {
-          headers: { [ZCODE_RPC_HOST_CAPABILITY_HEADER]: capability },
+          headers: {
+            [ZCODE_RPC_HOST_CAPABILITY_HEADER]: capability,
+            // 网关层（Caddy）对 /ws/host 同样要求 Bearer enroll token——capability 票据
+            // 只对中继有效，网关在它前面；缺这个头会在网关 401，桥表现为无限重连。
+            authorization: `Bearer ${enrollToken}`,
+          },
           handshakeTimeout: WS_HANDSHAKE_TIMEOUT_MS,
         });
       } catch (error) {
