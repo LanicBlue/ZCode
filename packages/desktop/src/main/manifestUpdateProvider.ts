@@ -199,7 +199,11 @@ export class ManifestUpdateProvider extends Provider<UpdateInfo> {
   }
 
   override get isUseMultipleRangeRequest(): boolean {
-    return false;
+    // 官方 manifest API 不保证支持 Range，保持关闭；自托管 feed（manifestUrl 指向
+    // Caddy 静态目录）支持 Range，开启后差分下载把上千个零散区间打包成少量并发
+    // 请求，避免逐区间串行往返把 ~20MB 差分拖回全量耗时。注意这只影响差分的
+    // 传输方式，差分能否启用取决于 manifest files[].size（见 lanie-upgrade.mjs）。
+    return Boolean(this.options.manifestUrl?.trim());
   }
 
   override async getLatestVersion(): Promise<UpdateInfo> {

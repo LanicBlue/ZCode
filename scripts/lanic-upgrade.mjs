@@ -288,13 +288,18 @@ for (const signal of ["SIGTERM", "SIGKILL"]) {
       .replace(/^\/+/, "");
   }
   const sha512 = createHash("sha512").update(readFileSync(zipPath)).digest("base64");
+  const zipSize = statSync(zipPath).size;
   copyFileSync(zipPath, join(feedDir, zipName));
   // blockmap 是差分更新必需，缺了 electron-updater 整包下载兜底也过不了 —— 直接 fail。
   if (!existsSync(`${zipPath}.blockmap`)) fail(`feed 产物缺失：${zipPath}.blockmap`);
   copyFileSync(`${zipPath}.blockmap`, join(feedDir, `${zipName}.blockmap`));
+  // files[] 必须带 size：差分引擎最后一步校验 downloadSize+copySize===files[0].size，
+  // legacy 单 path 形状没有 size 字段 → 校验必抛 → 每次都静默回退 186MB 全量下载
+  // （实测坐实：缓存有旧包+blockmap、差分条件全齐仍全量）。path/sha512 顶层字段保留兼容。
   wf(
     join(feedDir, "latest-mac.yml"),
-    `version: ${pkgNow.version}\npath: ${feedPathPrefix}${zipName}\nsha512: ${sha512}\n`,
+    `version: ${pkgNow.version}\npath: ${feedPathPrefix}${zipName}\nsha512: ${sha512}\n` +
+      `files:\n  - url: ${feedPathPrefix}${zipName}\n    sha512: ${sha512}\n    size: ${zipSize}\n`,
   );
   console.log(`feed 产出：${feedDir}（latest-mac.yml + ${zipName} + blockmap）`);
   if (feedUrlRaw) {
