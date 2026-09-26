@@ -16,8 +16,9 @@
  *  - attach 复用 http.ts 的 setupChannelServer：LoggingChannelServer、connectionScope、
  *    非 desktop-continuous 禁 provisioning 的覆盖、exposeOnChannelServer 一字不改。
  *  - capability 沿用 createHostCapabilityStore：一次性 + 30s TTL + 防重放语义不变。
- *  - 挂载白名单永不包含凭据邻接三件套：ICredentialService / IOAuthService /
- *    IProviderProvisioningTargetService（DESIGN §3-3，双保险：桌面侧过滤注册 + 本侧硬排除）。
+ *  - 挂载白名单永不包含 credential / provider-provisioning-target（DESIGN §3-3，
+ *    双保险：桌面侧过滤注册 + 本侧硬排除）。oauth / provider-settings 只经设备侧
+ *    脱敏包装放行（见 RELAY_FORBIDDEN_DEVICE_SERVICES 注释的信任模型）。
  */
 import { readFile } from "node:fs/promises";
 import { timingSafeEqual } from "node:crypto";
@@ -102,24 +103,27 @@ function startWebSocketHeartbeat(raw: WebSocket): () => void {
 
 /**
  * 凭据邻接面：任何挂载白名单都不得包含（含配置面错误也直接拒绝启动）。
- * DESIGN §3-3「全量减 ICredentialService 减 IProviderProvisioningTarget 减 IOAuthService」
- * + K2 复核新增 IProviderSettingsService（getView 的 personalConfig/effectiveConfig 内含
- * 明文 apiKey，provider/src 无脱敏；加 redaction 前不入白名单）。
- * 桌面侧镜像清单见 desktop/src/host/remoteBridge.ts REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES。
+ * DESIGN §3-3「全量减 ICredentialService 减 IProviderProvisioningTarget 减 IOAuthService」。
+ * 信任模型更新：oauth / provider-settings 已从双侧一刀切硬禁改为「只许设备侧脱敏包装」——
+ * host 是信任锚，脱敏/只读保证在 desktop/src/host/remoteBridge.ts 结构化强制
+ * （REMOTE_BRIDGE_REDACTED_CHANNELS + registerRedactedChannel brand 校验，raw 实例注册
+ * 即 fail）。relay 在这两条通道上只做透明转发，不再重复拦（重复拦会让包装后的合法
+ * 调用也打不通）；credential / provider-provisioning-target 维持双侧硬禁，
+ * 桌面侧镜像清单见 remoteBridge.ts REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES。
  */
 export const RELAY_FORBIDDEN_DEVICE_SERVICES: readonly ServiceDescriptor<unknown>[] = [
   ICredentialService,
-  IOAuthService,
   IProviderProvisioningTargetService,
-  IProviderSettingsService,
 ];
 
 /**
  * K2 定案的最小必需集（DESIGN §5-K2 + K3 复核）= 桌面桥 REMOTE_BRIDGE_SERVICE_WHITELIST
  * 的同构清单：setting/modelSelection/agent/session/task/file/terminal/broadcast。
- * modelSelection 的 apiKey-redaction 在设备侧注册面完成（remoteBridge.ts）。
- * IGitService / ISystemService 未入最小集（缺=降级不挂，K2 实测）；可用
- * RelayServerOptions.deviceServiceWhitelist 覆盖做实验，但与上面禁入清单求交永远为空。
+ * modelSelection 的 apiKey-redaction 在设备侧注册面完成（remoteBridge.ts）；
+ * oauth / provider-settings 同理由设备侧分别以只读/脱敏包装注册（见上信任模型注释），
+ * 这里挂的是同名通道的透明代理。IGitService / ISystemService 未入最小集（缺=降级不挂，
+ * K2 实测）；可用 RelayServerOptions.deviceServiceWhitelist 覆盖做实验，但与上面
+ * 禁入清单求交永远为空。
  */
 export const DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST: readonly ServiceDescriptor<unknown>[] = [
   ISettingService,
@@ -130,6 +134,8 @@ export const DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST: readonly ServiceDescriptor<
   IFileService,
   ITerminalService,
   IBroadcastService,
+  IOAuthService,
+  IProviderSettingsService,
 ];
 
 /** /devices 列表项（JSON API 与小页共用形状）。 */
@@ -414,7 +420,9 @@ export function createRelayServer(port = 3031, options: RelayServerOptions = {})
         isEnrollTokenPath(pathname) ||
         !isTokenProtectedPath(pathname) ||
         (authToken ? hasValidLiteToken(c, authToken) : false) ||
-        (autheliaTrusted && !isEnrollTokenPath(pathname) && Boolean(c.req.header("Remote-User")?.trim()));
+        (autheliaTrusted &&
+          !isEnrollTokenPath(pathname) &&
+          Boolean(c.req.header("Remote-User")?.trim()));
       if (passesLiteGate) {
         await next();
         return;

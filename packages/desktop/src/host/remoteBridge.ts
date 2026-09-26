@@ -12,15 +12,19 @@
  *   → 断线后抖动退避重连（full jitter，防雷群）；relay 重启自愈由此获得。
  *
  * ── 安全边界（对抗审查硬验收项，DESIGN §3-3 / §7）──────────────────────────────
- * 1. `REMOTE_BRIDGE_SERVICE_WHITELIST` + `registerWhitelistedChannels` 是【唯一】注册面：
- *    向 channel 注册的服务只有 K2 定案的 8 个最小集。凭据邻接四件套
- *    ICredentialService / IOAuthService / IProviderProvisioningTargetService /
- *    IProviderSettingsService 硬排除（`assertWhitelistExcludesForbiddenServices` 启动即校验）。
- * 2. IModelSelectionService 必须经 `createRedactedModelSelectionService` 包装：
- *    getView()/onDidChange 的 providers[].config 携带两类凭据——access 的明文
- *    apiKey/apiKeyManagementUrl 与 api.headers 的 header 型凭据（Authorization 等，
- *    provider/src/resolver.ts serializeRegistryProviderConfig 直传），响应一律
- *    strip（见 redactModelSelectionView）后才出设备。
+ * 1. `REMOTE_BRIDGE_SERVICE_WHITELIST` + `REMOTE_BRIDGE_REDACTED_CHANNELS` +
+ *    `registerWhitelistedChannels` 是【唯一】注册面：向 channel 注册的服务只有 K2
+ *    定案的最小集。ICredentialService / IProviderProvisioningTargetService 双侧硬禁
+ *    （`assertWhitelistExcludesForbiddenServices` 启动即校验）；IOAuthService /
+ *    IProviderSettingsService 不允许 raw 注册，只允许经各自的只读脱敏包装进入
+ *    （`REMOTE_BRIDGE_REDACTED_CHANNELS` → `registerRedactedChannel` brand 校验，
+ *    raw 实例缺包装标记=注册即 fail）。
+ * 2. IModelSelectionService / IProviderSettingsService 必须经各自 redaction 包装：
+ *    view 的 providers[*].config 携带两类凭据——access 的明文 apiKey/apiKeyManagementUrl
+ *    与 api.headers 的 header 型凭据（Authorization 等，provider/src/resolver.ts
+ *    serializeRegistryProviderConfig 直传），响应一律 strip（见 redactModelSelectionView /
+ *    redactProviderSettingsView）后才出设备。IOAuthService 只放读侧（登录态展示），
+ *    OAuth flow/登出/刷新全部拒绝。
  * 3. 本模块绝不使用 ServiceCollection.exposeOnChannelServer（全量无差别暴露，
  *    services/src/collection.ts:34-40）。
  */
@@ -39,6 +43,8 @@ import {
   IBroadcastService,
   IFileService,
   IModelSelectionService,
+  IOAuthService,
+  IProviderSettingsService,
   ISettingService,
   ITerminalService,
   IZCodeAgentService,
@@ -81,6 +87,7 @@ interface RemoteBridgeLogger {
  * - IFileService / ITerminalService：文件树/附件兜底 + 终端面板（K3 硬验收项）。
  * - IBroadcastService：缺=纯降级但零风险，StoreProvider/IntlProvider 语义前提。
  * IGitService / ISystemService 未入 K2 最小集（缺=降级不挂，K2 实测），保持排除收窄审查面。
+ * oauth / provider-settings 不在主表：它们是 wrapped-only 通道，见 REMOTE_BRIDGE_REDACTED_CHANNELS。
  */
 export const REMOTE_BRIDGE_SERVICE_WHITELIST: readonly ServiceDescriptor<unknown>[] = [
   ISettingService,
@@ -96,8 +103,13 @@ export const REMOTE_BRIDGE_SERVICE_WHITELIST: readonly ServiceDescriptor<unknown
 /**
  * 凭据邻接服务的 channelName 镜像清单（shared/src/channels.ts ServiceChannels）：
  * ICredentialService / IOAuthService / IProviderProvisioningTargetService / IProviderSettingsService。
- * 用字符串镜像而非 import 描述符，防止“顺手加回来”式回归；与 server/src/relay.ts
- * RELAY_FORBIDDEN_DEVICE_SERVICES 互为两侧双保险。
+ * 用字符串镜像而非 import 描述符，防止“顺手加回来”式回归。语义是【raw 注册禁入】：
+ * credential / provider-provisioning-target 永不放行（双侧硬禁）；oauth /
+ * provider-settings 只允许经 REMOTE_BRIDGE_REDACTED_CHANNELS 的脱敏包装注册，
+ * raw 实例同样进不了这张主表。与 server/src/relay.ts
+ * RELAY_FORBIDDEN_DEVICE_SERVICES（credential/provisioning-target）互为两侧双保险；
+ * oauth/provider-settings 的脱敏保证在 host 侧结构化强制（见 registerRedactedChannel），
+ * relay 不再重复拦这两个通道。
  */
 const REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES: readonly string[] = [
   "credential",
@@ -114,6 +126,18 @@ function assertWhitelistExcludesForbiddenServices(): void {
         `Remote bridge whitelist must not include credential-adjacent service: ${forbidden}`,
       );
     }
+  }
+  const redactedNames = REMOTE_BRIDGE_REDACTED_CHANNELS.map(
+    (entry) => entry.descriptor.channelName,
+  );
+  for (const name of redactedNames) {
+    // wrapped-only 通道名混进 raw 主表 = raw 注册路径可达，必须在启动时暴露。
+    if (names.includes(name)) {
+      throw new Error(`Remote bridge raw whitelist overlaps redacted channel: ${name}`);
+    }
+  }
+  if (new Set(redactedNames).size !== redactedNames.length) {
+    throw new Error("Remote bridge redacted channels must have unique channel names");
   }
 }
 
@@ -173,13 +197,244 @@ export function redactModelSelectionView<View extends { providers?: unknown }>(v
 export function createRedactedModelSelectionService(
   service: IModelSelectionService,
 ): IModelSelectionService {
-  return {
+  return markRedacted<IModelSelectionService>({
     getView: async (input) => redactModelSelectionView(await service.getView(input)),
     onDidChange: (listener) =>
       service.onDidChange((view) => {
         listener(redactModelSelectionView(view));
       }),
+  });
+}
+
+// ── wrapped-only 通道注册（oauth / provider-settings 的结构化强制）────────────
+//
+// 这两个通道名不允许 raw 注册：唯一注册入口 registerRedactedChannel 校验实例带
+// REMOTE_BRIDGE_REDACTED_BRAND（只有本文件的包装工厂会打标），raw 服务直接注册
+// 在启动/重连注册时即 fail。原版 web UI 的 ProxyChannel 按 channel name 取服务，
+// 所以通道名必须与 shared ServiceChannels 完全一致（UI 代码零改动的前提）。
+
+const REMOTE_BRIDGE_REDACTED_BRAND = Symbol("zcode.remoteBridgeRedactedService");
+
+function markRedacted<T extends object>(service: T): T {
+  Object.defineProperty(service, REMOTE_BRIDGE_REDACTED_BRAND, {
+    value: true,
+    enumerable: false,
+  });
+  return service;
+}
+
+/** 暴露给启动断言/单测：实例是否出自本文件的脱敏包装工厂。 */
+export function isRemoteBridgeRedactedService(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as Record<symbol, unknown>)[REMOTE_BRIDGE_REDACTED_BRAND] === true
+  );
+}
+
+function rejectRemoteChannelMethod(channel: string, method: string): never {
+  throw new Error(`${channel}.${method} is not available on the remote bridge (read-only channel)`);
+}
+
+/**
+ * IOAuthService 的只读包装：只放登录态展示读侧。
+ * 读侧返回值形状复核（shared/src/oauth.ts）：UserInfo={id,username,displayName,avatarUrl?}、
+ * OAuthProviderMeta={id,displayName,enabled,order}、OAuthCachedSessionRestoreResult 只包
+ * userInfo/状态分支——均无 token/secret 字段（services/src/oauth/oauthService.ts toUserInfo
+ * 只投影这四个展示字段），无需二次剥离。
+ * 写侧（OAuth flow/回调/轮询/刷新/登出/取消）全部抛错——远控面不得改动设备登录态，
+ * 抛错而不是假数据，让原版 UI 的失败分支自然生效。
+ */
+export function createReadOnlyOAuthService(service: IOAuthService): IOAuthService {
+  return markRedacted<IOAuthService>({
+    getProviders: () => service.getProviders(),
+    getActiveProvider: () => service.getActiveProvider(),
+    restoreCachedSession: () => service.restoreCachedSession(),
+    restoreCachedSessionState: () => service.restoreCachedSessionState(),
+    restoreSession: () => service.restoreSession(),
+    startOAuth: () => rejectRemoteChannelMethod("oauth", "startOAuth"),
+    startOAuthWithPolling: () => rejectRemoteChannelMethod("oauth", "startOAuthWithPolling"),
+    pollPendingOAuth: () => rejectRemoteChannelMethod("oauth", "pollPendingOAuth"),
+    handleCallback: () => rejectRemoteChannelMethod("oauth", "handleCallback"),
+    refreshToken: () => rejectRemoteChannelMethod("oauth", "refreshToken"),
+    logout: () => rejectRemoteChannelMethod("oauth", "logout"),
+    logoutAll: () => rejectRemoteChannelMethod("oauth", "logoutAll"),
+    cancelPending: () => rejectRemoteChannelMethod("oauth", "cancelPending"),
+  });
+}
+
+/** 剥离单个 ProviderConfigObject 形状对象的两处凭据面：access.{apiKey,apiKeyManagementUrl} 与 api.headers。 */
+function redactProviderConfigFields(config: UnknownRecord): UnknownRecord {
+  let next: UnknownRecord | null = null;
+  if (isPlainObject(config.access)) {
+    const access = config.access;
+    if ("apiKey" in access || "apiKeyManagementUrl" in access) {
+      const {
+        ["apiKey"]: _apiKey,
+        ["apiKeyManagementUrl"]: _apiKeyManagementUrl,
+        ...restAccess
+      } = access;
+      next = { ...config, access: restAccess };
+    }
+  }
+  if (isPlainObject(config.api) && "headers" in config.api) {
+    const { ["headers"]: _headers, ...restApi } = config.api;
+    next = { ...(next ?? config), api: restApi };
+  }
+  return next ?? config;
+}
+
+/** ProviderSettingsView 内 provider 级配置出现凭据面的全部字段（models[*] 是 ModelConfigObject，不含凭据）。 */
+const PROVIDER_SETTINGS_REDACTED_CONFIG_FIELDS = [
+  "personalConfig",
+  "effectiveConfig",
+  "effectiveBuiltinConfig",
+] as const;
+
+/**
+ * 剥离 ProviderSettingsView 的凭据面：providers[*].{personalConfig,effectiveConfig,
+ * effectiveBuiltinConfig} 与 providerTemplates[*].config（均为 ProviderConfigObject）。
+ * 手法与 redactModelSelectionView 一致：只沿需要改写的路径浅拷贝，未知形状原样放过；
+ * accountState（AccountProviderState）已复核只含 availability/entitled/connectionKey 等
+ * 非凭据字段（provider/src/account-provider-state.ts 自述“不包含凭据”），不剥。
+ */
+export function redactProviderSettingsView<
+  View extends { providers?: unknown; providerTemplates?: unknown },
+>(view: View): View {
+  if (!isPlainObject(view)) {
+    return view;
+  }
+  let changed = false;
+  let providers: unknown[] | undefined;
+  if (Array.isArray(view.providers)) {
+    providers = view.providers.map((provider) => {
+      if (!isPlainObject(provider)) {
+        return provider;
+      }
+      let nextProvider: UnknownRecord | null = null;
+      for (const field of PROVIDER_SETTINGS_REDACTED_CONFIG_FIELDS) {
+        const config = provider[field];
+        if (!isPlainObject(config)) {
+          continue;
+        }
+        const redactedConfig = redactProviderConfigFields(config);
+        if (redactedConfig !== config) {
+          nextProvider = { ...(nextProvider ?? provider), [field]: redactedConfig };
+        }
+      }
+      if (!nextProvider) {
+        return provider;
+      }
+      changed = true;
+      return nextProvider;
+    });
+  }
+  let providerTemplates: unknown[] | undefined;
+  if (Array.isArray(view.providerTemplates)) {
+    providerTemplates = view.providerTemplates.map((template) => {
+      if (!isPlainObject(template) || !isPlainObject(template.config)) {
+        return template;
+      }
+      const redactedConfig = redactProviderConfigFields(template.config);
+      if (redactedConfig === template.config) {
+        return template;
+      }
+      changed = true;
+      return { ...template, config: redactedConfig };
+    });
+  }
+  if (!changed) {
+    return view;
+  }
+  return {
+    ...view,
+    ...(providers ? { providers } : {}),
+    ...(providerTemplates ? { providerTemplates } : {}),
   };
+}
+
+/**
+ * IProviderSettingsService 的只读脱敏包装：getView/refresh 响应与 onDidChange 事件全部
+ * 过滤；全部 mutation（含 resolveModelConfig/testModelConnectivity 这类编辑器辅助流）
+ * 一律抛错——远控面是只读观察，不是第二套配置编辑入口。
+ */
+export function createRedactedProviderSettingsService(
+  service: IProviderSettingsService,
+): IProviderSettingsService {
+  return markRedacted<IProviderSettingsService>({
+    getView: async () => redactProviderSettingsView(await service.getView()),
+    refresh: async (reason) => redactProviderSettingsView(await service.refresh(reason)),
+    onDidChange: (listener) =>
+      service.onDidChange((view) => {
+        listener(redactProviderSettingsView(view));
+      }),
+    createPersonalProvider: () =>
+      rejectRemoteChannelMethod("provider-settings", "createPersonalProvider"),
+    resolveModelConfig: () => rejectRemoteChannelMethod("provider-settings", "resolveModelConfig"),
+    savePersonalProviderOverlay: () =>
+      rejectRemoteChannelMethod("provider-settings", "savePersonalProviderOverlay"),
+    deletePersonalProvider: () =>
+      rejectRemoteChannelMethod("provider-settings", "deletePersonalProvider"),
+    reorderPersonalProviders: () =>
+      rejectRemoteChannelMethod("provider-settings", "reorderPersonalProviders"),
+    reorderPersonalModels: () =>
+      rejectRemoteChannelMethod("provider-settings", "reorderPersonalModels"),
+    addPersonalModel: () => rejectRemoteChannelMethod("provider-settings", "addPersonalModel"),
+    renamePersonalModel: () =>
+      rejectRemoteChannelMethod("provider-settings", "renamePersonalModel"),
+    deletePersonalModel: () =>
+      rejectRemoteChannelMethod("provider-settings", "deletePersonalModel"),
+    savePersonalModelDraft: () =>
+      rejectRemoteChannelMethod("provider-settings", "savePersonalModelDraft"),
+    setPersonalModelEnabled: () =>
+      rejectRemoteChannelMethod("provider-settings", "setPersonalModelEnabled"),
+    testModelConnectivity: () =>
+      rejectRemoteChannelMethod("provider-settings", "testModelConnectivity"),
+  });
+}
+
+/** wrapped-only 通道注册表：descriptor 只用来取实例与 channel 名，包装工厂是唯一产物来源。 */
+interface RemoteBridgeRedactedChannelRegistration {
+  readonly descriptor: ServiceDescriptor<object>;
+  readonly createWrapped: (service: object) => object;
+}
+
+/** 收窄定义点，让循环注册侧拿到统一的非泛型形状（cast 只发生在这里）。 */
+function defineRedactedChannel<T>(
+  descriptor: ServiceDescriptor<T>,
+  createWrapped: (service: T) => T,
+): RemoteBridgeRedactedChannelRegistration {
+  return {
+    descriptor: descriptor as ServiceDescriptor<object>,
+    createWrapped: createWrapped as unknown as (service: object) => object,
+  };
+}
+
+/**
+ * oauth / provider-settings 的注册表（原版 web UI 按 channel name 消费这两个通道）。
+ * 每条 = 描述符 + 脱敏包装工厂；raw 实例没有入口（见文件头安全边界第 1 条）。
+ */
+const REMOTE_BRIDGE_REDACTED_CHANNELS: readonly RemoteBridgeRedactedChannelRegistration[] = [
+  defineRedactedChannel(IOAuthService, createReadOnlyOAuthService),
+  defineRedactedChannel(IProviderSettingsService, createRedactedProviderSettingsService),
+];
+
+/**
+ * wrapped-only 通道的唯一 registerChannel 入口：实例必须带包装 brand（只有本文件的
+ * 脱敏工厂会打标）。raw IOAuthService/IProviderSettingsService 流入这里会在注册时
+ * 立即 throw——桥按连接注册，等价于启动即 fail。
+ */
+function registerRedactedChannel(
+  server: ChannelServer,
+  channelName: string,
+  wrappedService: object,
+): void {
+  if (!isRemoteBridgeRedactedService(wrappedService)) {
+    throw new Error(
+      `Remote bridge channel '${channelName}' must be registered through its redaction wrapper (raw service rejected)`,
+    );
+  }
+  server.registerChannel(channelName, ProxyChannel.fromService(wrappedService));
 }
 
 // ── ws → ISocket 适配（与 server/src/http.ts wrapWebSocket 同形，客户端方向）──
@@ -380,8 +635,10 @@ export async function startRemoteBridge(options: {
   };
 
   // ── 白名单注册面（唯一，对抗审查焦点）────────────────────────────────────
-  // 只注册 REMOTE_BRIDGE_SERVICE_WHITELIST；逐条 getOptional，缺失服务跳过并 warn
-  // （fail-soft：少一个服务不炸整条桥，对应 K2 失败模式表的“缺=降级”）。
+  // raw 主表只注册 REMOTE_BRIDGE_SERVICE_WHITELIST；oauth / provider-settings 走
+  // REMOTE_BRIDGE_REDACTED_CHANNELS 的包装工厂 + registerRedactedChannel（brand 校验）。
+  // 逐条 getOptional，缺失服务跳过并 warn（fail-soft：少一个服务不炸整条桥，
+  // 对应 K2 失败模式表的“缺=降级”）。
   const registerWhitelistedChannels = (server: ChannelServer): void => {
     for (const descriptor of REMOTE_BRIDGE_SERVICE_WHITELIST) {
       if (descriptor === IModelSelectionService) {
@@ -390,9 +647,10 @@ export async function startRemoteBridge(options: {
           log.warn(`[remote-bridge] service unavailable, skip channel: ${descriptor.channelName}`);
           continue;
         }
-        server.registerChannel(
+        registerRedactedChannel(
+          server,
           descriptor.channelName,
-          ProxyChannel.fromService(createRedactedModelSelectionService(service)),
+          createRedactedModelSelectionService(service),
         );
         continue;
       }
@@ -433,6 +691,14 @@ export async function startRemoteBridge(options: {
         continue;
       }
       server.registerChannel(descriptor.channelName, ProxyChannel.fromService(instance));
+    }
+    for (const { descriptor, createWrapped } of REMOTE_BRIDGE_REDACTED_CHANNELS) {
+      const service = options.services.getOptional(descriptor);
+      if (!service) {
+        log.warn(`[remote-bridge] service unavailable, skip channel: ${descriptor.channelName}`);
+        continue;
+      }
+      registerRedactedChannel(server, descriptor.channelName, createWrapped(service));
     }
   };
 
