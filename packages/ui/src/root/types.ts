@@ -34,6 +34,12 @@ export interface RootProps {
   supportsEmbeddedBrowser?: boolean;
   /** 是否启用远程工作区能力，Web 普通模式先只支持本地 server 工作区 */
   allowRemoteWorkspace?: boolean;
+  /**
+   * 远控 Web 会话（/?remote=<deviceId> 经中继挂载桌面）：跳过设备首跑引导全家桶
+   * （职业引导 + 设置迁移 OnboardingDialog）。引导/迁移是设备本机首跑流程，记录服务
+   * 不在远控白名单里（RPC 挂起/超时后退回误判或报错弹窗），远端浏览器不应替设备答。
+   */
+  remoteWebSession?: boolean;
   /** 非桌面入口初始 workspace 注入前继续展示的 loading，桌面端不使用 */
   initialWorkspaceLoadingFallback?: ReactNode;
   /** Assistant code-comment 卡片灰度；默认关闭，关闭时保留原始 directive。 */

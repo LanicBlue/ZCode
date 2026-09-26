@@ -10,6 +10,7 @@
   },
   "scripts": {
     "dev": "tsup --watch --onSuccess 'node dist/entry-http.js'",
+    "dev:relay": "tsup --watch --onSuccess 'node dist/entry-relay.js'",
     "build": "tsup && pnpm run build:remote",
     "build:remote": "tsx build-remote.ts",
     "lint": "oxlint",

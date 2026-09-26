@@ -10,6 +10,8 @@ declare const __ZCODE_ENV__: string;
 declare const __ZCODE_PRODUCT_FLAVOR__: string;
 declare const __ZCODE_FORK_UPDATE_FEED_URL__: string;
 declare const __ZCODE_FORK_UPDATE_FEED_TOKEN__: string;
+declare const __ZCODE_FORK_REMOTE_SERVER_URL__: string;
+declare const __ZCODE_FORK_REMOTE_ENROLL_TOKEN__: string;
 
 export function normalizeZCodeEnv(value: string | undefined): ZCodeEnv {
   return value?.trim().toLowerCase() === "production" ? "production" : "test";
@@ -59,6 +61,29 @@ export const ZCODE_FORK_UPDATE_FEED_TOKEN: string =
 
 /** 更新入口总门：无自托管 feed 时维持全关（与最初 fork 决策一致）。 */
 export const ZCODE_FORK_DISABLE_UPDATES: boolean = ZCODE_FORK_UPDATE_FEED_URL === "";
+
+/**
+ * Fork 远控桥（zcode-web-selfhost DESIGN v3.1 §5-K3）：ECS 中继地址（如
+ * https://zcode.codenotincluded.com）。构建期 `ZCODE_FORK_REMOTE_SERVER_URL` 注入；
+ * 空 = 桥模块整体静默关闭（行为同无 feed 时更新链全关），不出网、不 spawn 专用 host。
+ */
+export const ZCODE_FORK_REMOTE_SERVER_URL: string =
+  typeof __ZCODE_FORK_REMOTE_SERVER_URL__ !== "undefined" ? __ZCODE_FORK_REMOTE_SERVER_URL__ : "";
+
+/**
+ * 中继的设备准入凭据（构建期 `ZCODE_FORK_REMOTE_ENROLL_TOKEN` 注入）：Bearer enroll token，
+ * 只用于桌面→中继方向（POST /api/rpc-host-capability + /ws/host 握手前的取票）。
+ * 与 `ZCODE_FORK_UPDATE_FEED_TOKEN` 绝不复用（泄漏面合并=能拉安装包即可注册设备，DESIGN §7）。
+ */
+export const ZCODE_FORK_REMOTE_ENROLL_TOKEN: string =
+  typeof __ZCODE_FORK_REMOTE_ENROLL_TOKEN__ !== "undefined"
+    ? __ZCODE_FORK_REMOTE_ENROLL_TOKEN__
+    : "";
+
+/** 桥总门：URL 为空即整模块关闭（token 缺失时同样关闭，避免无凭据空转打点）。 */
+export const ZCODE_FORK_REMOTE_BRIDGE_ENABLED: boolean =
+  ZCODE_FORK_REMOTE_SERVER_URL !== "" && ZCODE_FORK_REMOTE_ENROLL_TOKEN !== "";
+
 export const ZCODE_APP_VERSION_ENV = "ZCODE_APP_VERSION" as const;
 export const ZCODE_BUILD_COMMIT_ID_ENV = "ZCODE_BUILD_COMMIT_ID" as const;
 

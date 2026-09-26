@@ -41,7 +41,8 @@ import {
 import { connectRemote, createRemoteBackend, type RemoteConnection } from "./remote/index.js";
 import { createHostCapabilityStore } from "./hostCapability.js";
 
-function wrapWebSocket(ws: WebSocket): ISocket {
+/** 供 entry-http 与中继形态（relay.ts）共用的 ws → ISocket 适配。 */
+export function wrapWebSocket(ws: WebSocket): ISocket {
   const onData = new Emitter<VSBuffer>();
   const onClose = new Emitter<void>();
   const onEnd = new Emitter<void>();
@@ -83,7 +84,8 @@ function wrapWebSocket(ws: WebSocket): ISocket {
 const log = (...args: unknown[]) =>
   console.log(formatLogPrefix("zcode-server:http", process.pid), ...args);
 
-function setupChannelServer(
+/** 中继形态（relay.ts）的 attach 端点必须复用本函数，保持上游全部挂载语义。 */
+export function setupChannelServer(
   ws: WebSocket,
   services: ServiceCollection,
   clientMode: "desktop-continuous" | "web-remote-replayable",
@@ -142,7 +144,7 @@ interface HttpServerOptions {
   workspaces?: ServerRemoteWorkspaceInfo[];
 }
 
-function readTrimmedEnv(name: string): string | undefined {
+export function readTrimmedEnv(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value ? value : undefined;
 }
@@ -224,7 +226,7 @@ function parseCookieHeader(header: string | undefined): Map<string, string> {
   return cookies;
 }
 
-function hasValidLiteToken(c: Context, token: string): boolean {
+export function hasValidLiteToken(c: Context, token: string): boolean {
   const url = new URL(c.req.url);
   if (url.searchParams.get("token") === token) {
     c.header(
@@ -236,7 +238,7 @@ function hasValidLiteToken(c: Context, token: string): boolean {
   return parseCookieHeader(c.req.header("cookie")).get(zcodeLiteTokenCookieName) === token;
 }
 
-function isTokenProtectedPath(pathname: string): boolean {
+export function isTokenProtectedPath(pathname: string): boolean {
   return pathname === "/ws" || pathname.startsWith("/ws/") || pathname.startsWith("/api/");
 }
 
@@ -249,7 +251,7 @@ function isInsideDirectory(root: string, candidate: string): boolean {
   return diff === "" || (!diff.startsWith("..") && !diff.includes(`..${sep}`));
 }
 
-async function resolveStaticFile(
+export async function resolveStaticFile(
   staticRoot: string,
   pathname: string,
   spaFallback: boolean,
@@ -291,7 +293,7 @@ async function resolveStaticFile(
   }
 }
 
-function staticContentType(filePath: string): string {
+export function staticContentType(filePath: string): string {
   return staticMimeTypes[extname(filePath).toLowerCase()] ?? "application/octet-stream";
 }
 

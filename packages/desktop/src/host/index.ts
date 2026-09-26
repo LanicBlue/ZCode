@@ -203,6 +203,27 @@ interface PendingLocalMediaPreviewPathAuthorization {
 
 const pendingFeedbackLogArchiveRequests = new Map<string, PendingFeedbackLogArchiveRequest>();
 let nextFeedbackLogArchiveRequestSeq = 0;
+
+// 远控桥句柄（仅专用 host 内非空）；Dispose/信号收口时先行关闭中继连接。
+let remoteBridge: Awaited<ReturnType<typeof import("./remoteBridge.js").startRemoteBridge>> | null =
+  null;
+
+/** main 侧 spawnRemoteBridgeHostProcess 写入的专用 host 身份标记。 */
+function isRemoteBridgeHostProcess(): boolean {
+  return process.env["ZCODE_REMOTE_BRIDGE_HOST"] === "1";
+}
+
+function disposeRemoteBridge(reason: string): void {
+  const bridge = remoteBridge;
+  remoteBridge = null;
+  if (!bridge) {
+    return;
+  }
+  logger.info(`[remote-bridge] disposing bridge (${reason})`);
+  void bridge.dispose().catch((error: unknown) => {
+    logger.warn("[remote-bridge] bridge dispose failed:", error);
+  });
+}
 const pendingLocalMediaPreviewPathAuthorizations = new Map<
   string,
   PendingLocalMediaPreviewPathAuthorization
@@ -2144,6 +2165,7 @@ async function disposeHostResources(reason: string): Promise<HostShutdownResult>
     stopHostNetworkTelemetry();
     hostSelfResourceTelemetry.stop();
     disposeLocalResourceTelemetry();
+    disposeRemoteBridge(reason);
     disposeAttachedServicePorts();
     windowHostControllerRuntime.dispose();
     for (const key of Array.from(cronRunSubscriptions.keys())) {
@@ -2213,6 +2235,7 @@ function disposeHostResourcesBestEffort(reason: string): void {
   logger.info(`disposing host resources, reason=${reason}`);
   stopHostNetworkTelemetry();
   disposeLocalResourceTelemetry();
+  disposeRemoteBridge(reason);
   disposeAttachedServicePorts();
   windowHostControllerRuntime.dispose();
   for (const key of Array.from(cronRunSubscriptions.keys())) {
@@ -2897,6 +2920,23 @@ parentPort.on("message", async (e: Electron.MessageEvent) => {
         wireLocalResourceTelemetry(services);
         hasDisposedHostResources = false;
         disposeHostResourcesInFlight = null;
+        // 远控桥专用 host（env 标记由 main 的 spawnRemoteBridgeHostProcess 写入）：
+        // local services 就绪后启动常驻中继连接。窗口 host（无标记）不加载该模块；
+        // 构建期未烧 URL/token 时 startRemoteBridge 内部静默关闭。启动失败不阻塞
+        // 本 host 的其余职责（桥故障隔离，DESIGN §7）。
+        if (isRemoteBridgeHostProcess()) {
+          try {
+            const { startRemoteBridge } = await import("./remoteBridge.js");
+            remoteBridge = await startRemoteBridge({
+              services,
+              deviceMid: msg.deviceMid,
+              logger,
+            });
+            logger.info("[remote-bridge] bridge started inside dedicated host");
+          } catch (error) {
+            logger.error("[remote-bridge] failed to start bridge:", error);
+          }
+        }
         const agentWarmupTargets =
           msg.agentWarmupTargets && msg.agentWarmupTargets.length > 0
             ? msg.agentWarmupTargets

@@ -85,6 +85,8 @@ interface WebBootstrapResult {
   initialTaskId?: string;
   restoreSession?: boolean;
   allowOpenWorkspace?: boolean;
+  /** ?remote=<deviceId> 远控挂载形态：跳过设备首跑职业引导（Root 侧消费）。 */
+  isRemoteWebSession?: boolean;
 }
 
 function isWebOAuthCallback(params: URLSearchParams): boolean {
@@ -363,8 +365,37 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
     ? `${resolveDefaultWsOrigin()}/ws/remote/${remoteId}`
     : `${resolveDefaultWsOrigin()}/ws`;
 
+  // 远控形态（/?remote=<deviceId>，经中继挂载桌面会话）：工作区信息改从中继的设备
+  // server-info 端点合成 initialWorkspaceAbsPath——Root 首屏可进入（上游 TODO 自认
+  // “无 initialWorkspace 会在项目向导/首屏卡住”）。设备离线/取不到时按无工作区降级。
   if (remoteId) {
-    return { wsUrl };
+    try {
+      // 直开 /?remote=<id>&token=…（无既有 cookie，如浏览器重启后）也要能过门：
+      // 把 URL 上的 lite token 转投给 server-info 请求，成功时服务端顺手换 HttpOnly cookie，
+      // 随后的 /ws/remote 挂载即凭 cookie 通过。
+      const liteToken = params.get("token");
+      const response = await fetch(
+        `/api/remote/${encodeURIComponent(remoteId)}/server-info${
+          liteToken ? `?token=${encodeURIComponent(liteToken)}` : ""
+        }`,
+        { cache: "no-store" },
+      );
+      if (!response.ok) {
+        return { wsUrl, isRemoteWebSession: true };
+      }
+      const serverInfo = (await response.json()) as Partial<ServerRemoteInfo>;
+      const workspace = Array.isArray(serverInfo.workspaces) ? serverInfo.workspaces[0] : undefined;
+      return {
+        wsUrl,
+        isRemoteWebSession: true,
+        ...(workspace?.path ? { initialWorkspaceAbsPath: workspace.path } : {}),
+        ...(workspace?.workspaceIdentity
+          ? { initialWorkspaceIdentity: workspace.workspaceIdentity }
+          : {}),
+      };
+    } catch {
+      return { wsUrl, isRemoteWebSession: true };
+    }
   }
 
   try {
@@ -463,6 +494,7 @@ async function bootstrapWebApp() {
             initialTaskId={bootstrap.initialTaskId}
             restoreSession={bootstrap.restoreSession}
             allowOpenWorkspace={bootstrap.allowOpenWorkspace}
+            remoteWebSession={bootstrap.isRemoteWebSession}
             preferDirectoryBrowser
             supportsEmbeddedBrowser={false}
             allowRemoteWorkspace={false}

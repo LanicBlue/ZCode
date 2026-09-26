@@ -38,6 +38,7 @@ export function OccupationOnboarding({
   showChildrenWhileLoading = false,
   isMacDesktop,
   isWindowsDesktop,
+  remoteWebSession = false,
 }: {
   children: ReactNode;
   /** Windows/Linux 自绘窗控：引导全屏覆盖主界面（含标题栏），需在此补最小化/最大化/关闭。 */
@@ -46,6 +47,12 @@ export function OccupationOnboarding({
   showChildrenWhileLoading?: boolean;
   isMacDesktop?: boolean;
   isWindowsDesktop?: boolean;
+  /**
+   * 远控 Web 会话（/?remote= 经中继挂载桌面）：整段跳过引导。onboarding-record
+   * 不在远控白名单，shouldOnboard 挂起超时后退回 settings 判定存在竞态（settings
+   * 未到时误判需引导）；且替设备答引导会把浏览器答案写进设备记录，语义错误。
+   */
+  remoteWebSession?: boolean;
 }) {
   const { settings, update } = useSettings();
   const platform = usePlatform();
@@ -211,6 +218,9 @@ export function OccupationOnboarding({
     applyLatestEntry();
     // eslint-disable-line react-hooks/exhaustive-deps
   }, [latestEntry]);
+  // 远控 Web 会话不展示设备首跑引导（见 prop 注释）：也不等 settings/记录判定，
+  // 主界面直达（其内部各自处理加载态）。
+  if (remoteWebSession) return <>{children}</>;
   if (!settings) return showChildrenWhileLoading ? <>{children}</> : null;
   // 判定进行中先不渲染，避免引导闪现后立即消失（判定为需引导）或先闪引导再进主界面。
   // 只有疑似首跑（settings 里也没有职业）才等待记录判定；存量用户（已有

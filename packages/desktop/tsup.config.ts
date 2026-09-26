@@ -109,6 +109,14 @@ function createSharedDefines() {
     __ZCODE_FORK_UPDATE_FEED_TOKEN__: JSON.stringify(
       process.env.ZCODE_FORK_UPDATE_FEED_TOKEN?.trim() ?? "",
     ),
+    // Fork 远控桥（DESIGN v3.1 §5-K3）：中继地址 + enroll token，烧进 main/host bundle。
+    // URL 为空 = 桥整体静默关闭（不出网、不 spawn 专用 host）；token 与 feed token 独立绝不复用。
+    __ZCODE_FORK_REMOTE_SERVER_URL__: JSON.stringify(
+      process.env.ZCODE_FORK_REMOTE_SERVER_URL?.trim() ?? "",
+    ),
+    __ZCODE_FORK_REMOTE_ENROLL_TOKEN__: JSON.stringify(
+      process.env.ZCODE_FORK_REMOTE_ENROLL_TOKEN?.trim() ?? "",
+    ),
     __ZCODE_PRODUCT_FLAVOR__: JSON.stringify(zcodeProductFlavor),
     // Computer Use Helper build identity — helperInstaller 读它决定下载哪个 Helper bundle。
     // 缺失时 installer 抛 "Packaged ZCode is missing its embedded Computer Use Helper build identity"。

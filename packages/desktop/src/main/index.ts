@@ -170,6 +170,10 @@ import {
 } from "./desktopHostProcess.js";
 import { spawnCronScheduler, type CronSchedulerHandle } from "./desktopCronScheduler.js";
 import {
+  spawnRemoteBridgeHostProcess,
+  type RemoteBridgeHostHandle,
+} from "./desktopRemoteBridgeHost.js";
+import {
   clearOAuthRoutesForWindow,
   handleDeepLink,
   handleOpenWorkspacePath,
@@ -635,6 +639,9 @@ const windowsCuaOperationIndicator = createWindowsCuaOperationIndicator({
 
 // 常驻 cron scheduler 进程句柄；app ready 后拉起，退出前销毁。
 let cronScheduler: CronSchedulerHandle | null = null;
+// 远控桥专用 host 句柄（DESIGN v3.1 附录 A：无窗口、不入 windowHostProcessMap，
+// 退出前并入 prepareAppQuit 屏障）；构建期未烧 URL/token 时 spawn 直接返回 null。
+let remoteBridgeHost: RemoteBridgeHostHandle | null = null;
 // host → main 的定时任务派发结果，转交给 scheduler 结算。经模块变量转发以避免 spawn 顺序耦合。
 function forwardCronRunResult(
   result: Parameters<CronSchedulerHandle["handleCronRunResult"]>[0],
@@ -1035,6 +1042,11 @@ async function prepareAppQuit(reason: string, kind: AppShutdownKind = "normal"):
   const cronSchedulerToDispose = cronScheduler;
   cronScheduler = null;
 
+  // 远控桥专用 host 并入同一退出屏障（附录 A.2：照 cronScheduler 先例显式挂接，
+  // 保住 host 优雅 Dispose 与 agent 树收口时序；桥故障/未启用时为 null 即 no-op）。
+  const remoteBridgeHostToDispose = remoteBridgeHost;
+  remoteBridgeHost = null;
+
   const hostProcesses = [
     ...new Set([...windowHostProcessMap.values(), ...listDisposingHostProcesses()]),
   ];
@@ -1059,6 +1071,13 @@ async function prepareAppQuit(reason: string, kind: AppShutdownKind = "normal"):
         await cronSchedulerToDispose?.dispose();
       } catch (error) {
         logger.warn(`[app-quit] cron scheduler dispose failed (${reason}):`, error);
+      }
+    })(),
+    (async () => {
+      try {
+        await remoteBridgeHostToDispose?.dispose();
+      } catch (error) {
+        logger.warn(`[app-quit] remote bridge host dispose failed (${reason}):`, error);
       }
     })(),
     // remote session、attachment 和 transport 都由窗口 Host 持有；这里先清理
@@ -1971,6 +1990,21 @@ app.whenReady().then(async () => {
       });
     } catch (error) {
       logger.error("[cron-scheduler] failed to spawn scheduler process:", error);
+    }
+    try {
+      // 远控桥专用 host 与 scheduler 同边界拉起：等首个窗口 host 完成库准备，避免抢先
+      // 迁移（附录 A：多 host 幂等但成本照加，K3 验收记内存差）。URL/token 未烧入时静默关闭。
+      remoteBridgeHost = spawnRemoteBridgeHostProcess({
+        hostProcessLocalEnv,
+        logger,
+        deviceMid,
+        agentSpawnFallbackCwd: getConversationWorkspaceDir(),
+        zcodeBuiltinProviderConfigFilePath: resolveZCodeBuiltinProviderConfigFilePath({
+          env: { ...hostProcessLocalEnv, ...process.env },
+        }),
+      });
+    } catch (error) {
+      logger.error("[remote-bridge] failed to spawn bridge host process:", error);
     }
   });
 
