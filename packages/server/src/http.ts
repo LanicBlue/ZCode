@@ -231,7 +231,10 @@ export function hasValidLiteToken(c: Context, token: string): boolean {
   if (url.searchParams.get("token") === token) {
     c.header(
       "Set-Cookie",
-      `${zcodeLiteTokenCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax`,
+      // Max-Age 90 天：会话级 cookie 浏览器一关就丢，?token= 书签就得重敲；
+      // 持久化后首访一次换 cookie，之后从功能矩阵卡片直进。token 仍是 Authelia
+      // 之后的第二道门，泄漏面有限。
+      `${zcodeLiteTokenCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=7776000`,
     );
     return true;
   }
