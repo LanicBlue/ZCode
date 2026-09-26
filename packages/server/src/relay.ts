@@ -16,9 +16,10 @@
  *  - attach 复用 http.ts 的 setupChannelServer：LoggingChannelServer、connectionScope、
  *    非 desktop-continuous 禁 provisioning 的覆盖、exposeOnChannelServer 一字不改。
  *  - capability 沿用 createHostCapabilityStore：一次性 + 30s TTL + 防重放语义不变。
- *  - 挂载白名单永不包含 credential / provider-provisioning-target（DESIGN §3-3，
- *    双保险：桌面侧过滤注册 + 本侧硬排除）。oauth / provider-settings 只放行读方法
- *    （方法级第二道墙，见 RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS 的信任模型注释）。
+ *  - 挂载白名单永不包含 provider-provisioning-target（DESIGN §3-3，双保险：桌面侧
+ *    过滤注册 + 本侧硬排除）。oauth / provider-settings / credential 只放行读方法
+ *    （方法级第二道墙，见 RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS 的信任模型注释；
+ *    credential 的逐键策略在设备侧包装里裁决，relay 只限方法面）。
  */
 import { readFile } from "node:fs/promises";
 import { timingSafeEqual } from "node:crypto";
@@ -105,27 +106,30 @@ function startWebSocketHeartbeat(raw: WebSocket): () => void {
  * 凭据邻接面：任何挂载白名单都不得包含（含配置面错误也直接拒绝启动）。
  * DESIGN §3-3「全量减 ICredentialService 减 IProviderProvisioningTarget 减 IOAuthService」。
  * 信任模型（security review 后更新，双道防线各自独立生效）：
- * - 第一道（host 包装）：oauth / provider-settings 由设备侧 remoteBridge.ts 以
- *   只读/脱敏包装注册（brand 校验，raw 实例注册即 fail），保证真设备的凭据不出网。
- * - 第二道（relay 方法级过滤，本文件）：credential / provider-provisioning-target
- *   维持双侧硬禁；oauth / provider-settings 只放行读方法（见
+ * - 第一道（host 包装）：oauth / provider-settings / credential 由设备侧
+ *   remoteBridge.ts 以只读/脱敏包装注册（brand 校验，raw 实例注册即 fail），保证
+ *   真设备的凭据不出网（credential 还有逐键策略：token 类键只回存在性占位）。
+ * - 第二道（relay 方法级过滤，本文件）：provider-provisioning-target 维持双侧硬禁；
+ *   oauth / provider-settings / credential 只放行读方法（见
  *   RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS）。enroll token 烧在每个安装包内可提取，
  *   /api/devices 又公开 deviceMid——持 token 的攻击者可注册冒充主机接管受害者的
- *   web 挂载并暴露 raw 写面（savePersonalProviderOverlay 录 key、startOAuthWithPolling
- *   authorizeUrl 钓鱼）。方法级过滤让网页客户端只经 relay 取这两条通道，非读方法
- *   在 relay 即拒绝，不转发给任何主机。桌面侧镜像清单见 remoteBridge.ts
- *   REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES / REMOTE_BRIDGE_REDACTED_CHANNELS。
+ *   web 挂载并暴露 raw 写面（savePersonalProviderOverlay 录 key、credential.save
+ *   录任意键值、startOAuthWithPolling authorizeUrl 钓鱼）。方法级过滤让网页客户端
+ *   只经 relay 取这三条通道，非读方法在 relay 即拒绝，不转发给任何主机。桌面侧
+ *   镜像清单见 remoteBridge.ts REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES /
+ *   REMOTE_BRIDGE_REDACTED_CHANNELS。
  */
 export const RELAY_FORBIDDEN_DEVICE_SERVICES: readonly ServiceDescriptor<unknown>[] = [
-  ICredentialService,
   IProviderProvisioningTargetService,
 ];
 
 /**
- * 方法级第二道墙：这两条通道在 relay 侧只放读方法，成员表与设备侧包装放行面镜像
- * （desktop remoteBridge.ts createReadOnlyOAuthService / createRedactedProviderSettingsService；
- * oauth 的 restoreCachedSession/restoreCachedSessionState 在设备侧经 peekCachedSessionState
- * dry 合成）。两表方向性漂移是安全的：设备侧多放一个方法而 relay 未跟 → 调用在 relay
+ * 方法级第二道墙：这三条通道在 relay 侧只放读方法，成员表与设备侧包装放行面镜像
+ * （desktop remoteBridge.ts createReadOnlyOAuthService /
+ * createRedactedProviderSettingsService / createReadOnlyCredentialService；oauth 的
+ * restoreCachedSession/restoreCachedSessionState 在设备侧经 peekCachedSessionState
+ * dry 合成；credential.load 的逐键裁决在设备侧包装内，relay 不重复键策略）。
+ * 两表方向性漂移是安全的：设备侧多放一个方法而 relay 未跟 → 调用在 relay
  * 被拒（可见失败）；relay 多放而设备未跟 → 调用在设备被拒。
  */
 export const RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS: Readonly<Record<string, readonly string[]>> = {
@@ -136,6 +140,7 @@ export const RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS: Readonly<Record<string, rea
     "restoreCachedSessionState",
   ],
   [IProviderSettingsService.channelName]: ["getView", "refresh", "onDidChange"],
+  [ICredentialService.channelName]: ["load"],
 };
 
 /**
@@ -163,10 +168,10 @@ export function createRelayReadOnlyDeviceService<T extends object>(
  * K2 定案的最小必需集（DESIGN §5-K2 + K3 复核）= 桌面桥 REMOTE_BRIDGE_SERVICE_WHITELIST
  * 的同构清单：setting/modelSelection/agent/session/task/file/terminal/broadcast。
  * modelSelection 的 apiKey-redaction 在设备侧注册面完成（remoteBridge.ts）；
- * oauth / provider-settings 同理由设备侧包装（第一道），并在本侧过方法级读过滤
- * （第二道，RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS）。IGitService / ISystemService
- * 未入最小集（缺=降级不挂，K2 实测）；可用 RelayServerOptions.deviceServiceWhitelist
- * 覆盖做实验，但与上面禁入清单求交永远为空。
+ * oauth / provider-settings / credential 同理由设备侧包装（第一道），并在本侧过
+ * 方法级读过滤（第二道，RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS）。IGitService /
+ * ISystemService 未入最小集（缺=降级不挂，K2 实测）；可用 RelayServerOptions.
+ * deviceServiceWhitelist 覆盖做实验，但与上面禁入清单求交永远为空。
  */
 export const DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST: readonly ServiceDescriptor<unknown>[] = [
   ISettingService,
@@ -179,6 +184,7 @@ export const DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST: readonly ServiceDescriptor<
   IBroadcastService,
   IOAuthService,
   IProviderSettingsService,
+  ICredentialService,
 ];
 
 /** /devices 列表项（JSON API 与小页共用形状）。 */
@@ -356,8 +362,8 @@ function registerDeviceServiceProxies(
 ): void {
   for (const descriptor of descriptors) {
     // 与 http.ts /ws/remote 相同的桥接形状：ChannelClient 代理经 ProxyChannel 重挂给网页。
-    // oauth / provider-settings 额外过方法级第二道墙：成员表外的调用在 relay 即
-    // Method not found，不转发给（可能是冒充的）主机。
+    // oauth / provider-settings / credential 额外过方法级第二道墙：成员表外的调用在
+    // relay 即 Method not found，不转发给（可能是冒充的）主机。
     const channel = client.getChannel(descriptor.channelName);
     services.register(
       descriptor as ServiceDescriptor<object>,

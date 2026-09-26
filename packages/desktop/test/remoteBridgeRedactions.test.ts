@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  REMOTE_BRIDGE_CREDENTIAL_PRESENT_PLACEHOLDER,
   REMOTE_BRIDGE_SERVICE_WHITELIST,
+  createReadOnlyCredentialService,
   createReadOnlyOAuthService,
   createRedactedProviderSettingsService,
   isRemoteBridgeRedactedService,
   redactProviderSettingsView,
   registerRedactedChannel,
   resolveRemoteBridgeChannelRuling,
+  resolveRemoteBridgeCredentialKeyRuling,
 } from "../src/host/remoteBridge.js";
 import {
+  ICredentialService,
   IOAuthService,
   IProviderSettingsService,
   type ProviderSettingsView,
@@ -147,6 +151,31 @@ function createFakeProviderSettingsService(view: ProviderSettingsView): IProvide
     savePersonalModelDraft: refuse("savePersonalModelDraft"),
     setPersonalModelEnabled: refuse("setPersonalModelEnabled"),
     testModelConnectivity: refuse("testModelConnectivity"),
+  };
+}
+
+/**
+ * 模拟真实 CredentialStore 的键值面：store 里的真值（含 token 真值）绝不能
+ * 原样穿过包装；deny-first 断言还要求白名单外的键根本不触底（不构成存在性预言机）。
+ */
+function createFakeCredentialService(
+  entries: Record<string, string | null> = {},
+): ICredentialService & { loadedKeys: string[]; writeCalls: string[] } {
+  const loadedKeys: string[] = [];
+  const writeCalls: string[] = [];
+  return {
+    loadedKeys,
+    writeCalls,
+    load: async (key) => {
+      loadedKeys.push(key);
+      return key in entries ? ((entries[key] ?? null) as string | null) : null;
+    },
+    save: async (key) => {
+      writeCalls.push(`save:${key}`);
+    },
+    delete: async (key) => {
+      writeCalls.push(`delete:${key}`);
+    },
   };
 }
 
@@ -373,16 +402,163 @@ test("provider-settings refresh is rate limited per wrapper instance and replays
   }
 });
 
+// ── credential：键策略只读、真值绝不出设备、写侧全拒 ─────────────────────────
+
+test("credential key policy table: passthrough for selector/user_info, presence for token keys, deny for everything else", () => {
+  // passthrough：provider id 选择器 + 展示载荷（packages/ui 无 user_info 直读调用点，
+  // 键位与 services oauthCredentialRepo userInfoKey 对齐留口）。
+  assert.equal(resolveRemoteBridgeCredentialKeyRuling("oauth:active_provider"), "passthrough");
+  assert.equal(resolveRemoteBridgeCredentialKeyRuling("oauth:zai:user_info"), "passthrough");
+  assert.equal(resolveRemoteBridgeCredentialKeyRuling("oauth:bigmodel:user_info"), "passthrough");
+  // presence：token 类键（真值即机密）。
+  for (const key of [
+    "oauth:zai:access_token",
+    "oauth:bigmodel:access_token",
+    "oauth:zai:refresh_token",
+    "oauth:bigmodel:id_token",
+    "oauth:zai:purchase_token",
+    "zcodejwttoken",
+  ]) {
+    assert.equal(resolveRemoteBridgeCredentialKeyRuling(key), "presence", key);
+  }
+  // deny：其余一切键（bot/web-remote-control/account-provider/SSH workspace 凭据/
+  // legacy auth_token/形状不符的 oauth 变体）。
+  for (const key of [
+    "bot:telegram:token",
+    "web-remote-control:secret",
+    "account-provider:zai:credential",
+    "remote-workspace:ws-1:password",
+    "remote-workspace:ws-1:private-key-passphrase",
+    "auth_token",
+    "oauth:zai:access_token_extra",
+    "oauth:zai:devicetoken",
+    "oauth:zai:user_info_extra",
+    "oauth:active_provider:extra",
+    "",
+  ]) {
+    assert.equal(resolveRemoteBridgeCredentialKeyRuling(key), null, key);
+  }
+});
+
+test("read-only credential service returns original value for active_provider and user_info", async () => {
+  const fake = createFakeCredentialService({
+    "oauth:active_provider": "zai",
+    "oauth:bigmodel:user_info": '{"id":"u1","username":"alice"}',
+  });
+  const wrapped = createReadOnlyCredentialService(fake);
+
+  // 原版设置页的实际消费：activeProvider 与 provider id 等值比较（选择器，非机密）。
+  assert.equal(await wrapped.load("oauth:active_provider"), "zai");
+  assert.equal(await wrapped.load("oauth:bigmodel:user_info"), '{"id":"u1","username":"alice"}');
+  assert.deepEqual(fake.loadedKeys, ["oauth:active_provider", "oauth:bigmodel:user_info"]);
+});
+
+test("read-only credential service maps token keys to a presence placeholder and never leaks real values", async () => {
+  const realAccessToken = "sk-real-zai-access-token";
+  const realJwt = "eyJhbGciOi.real.jwt";
+  const fake = createFakeCredentialService({
+    "oauth:zai:access_token": realAccessToken,
+    "oauth:bigmodel:refresh_token": "  ",
+    zcodejwttoken: realJwt,
+  });
+  const wrapped = createReadOnlyCredentialService(fake);
+
+  const returned: Array<string | null> = [
+    await wrapped.load("oauth:zai:access_token"),
+    await wrapped.load("oauth:bigmodel:refresh_token"),
+    await wrapped.load("zcodejwttoken"),
+    await wrapped.load("oauth:bigmodel:access_token"),
+  ];
+  // 真值非空 → 固定占位；空串/null/纯空白 → null（消费方 .trim().length > 0 存在性语义）。
+  assert.deepEqual(returned, [
+    REMOTE_BRIDGE_CREDENTIAL_PRESENT_PLACEHOLDER,
+    null,
+    REMOTE_BRIDGE_CREDENTIAL_PRESENT_PLACEHOLDER,
+    null,
+  ]);
+  for (const value of returned) {
+    assert.equal(
+      typeof value === "string" && (value.includes("sk-real") || value.includes("eyJhbGciOi")),
+      false,
+      "real token value must never leave the device",
+    );
+  }
+});
+
+test("read-only credential service rejects unknown keys deny-first without touching the device store", async () => {
+  const fake = createFakeCredentialService({ "bot:telegram:token": "bot-secret" });
+  const wrapped = createReadOnlyCredentialService(fake);
+
+  for (const key of [
+    "bot:telegram:token",
+    "web-remote-control:secret",
+    "account-provider:zai:credential",
+    "remote-workspace:ws-1:password",
+    "auth_token",
+  ]) {
+    await assert.rejects(
+      wrapped.load(key),
+      /credential\.load key '.*' is not available on the remote bridge \(read-only key policy\)/,
+      key,
+    );
+  }
+  // deny-first：白名单外的键根本不触底——桥不构成任意键的存在性预言机。
+  assert.deepEqual(fake.loadedKeys, []);
+  assert.deepEqual(fake.writeCalls, []);
+});
+
+test("read-only credential service rejects save/delete without touching the device store", () => {
+  const fake = createFakeCredentialService();
+  const wrapped = createReadOnlyCredentialService(fake);
+
+  assert.throws(
+    () => wrapped.save("oauth:zai:access_token", "captured-value"),
+    /credential\.save is not available on the remote bridge \(read-only channel\)/,
+  );
+  assert.throws(
+    () => wrapped.delete("oauth:zai:access_token"),
+    /credential\.delete is not available on the remote bridge \(read-only channel\)/,
+  );
+  assert.deepEqual(fake.loadedKeys, []);
+  assert.deepEqual(fake.writeCalls, []);
+});
+
+test("credential read errors are sanitized (no device stack)", async () => {
+  const fake = createFakeCredentialService();
+  const leaky = new Error("credential store decrypt failed");
+  leaky.stack = "Error: credential store decrypt failed\n    at /Users/device/.zcode/...";
+  (leaky as Error & { code?: unknown }).code = "KEYCHAIN_STATUS";
+  fake.load = async () => {
+    throw leaky;
+  };
+  const wrapped = createReadOnlyCredentialService(fake);
+
+  const caught = await wrapped.load("oauth:active_provider").then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.message, "credential store decrypt failed");
+  assert.equal(caught.stack, undefined);
+  assert.equal((caught as Error & { code?: unknown }).code, undefined);
+});
+
 // ── 注册结构：brand、结构化裁决、raw 直注册 fail ────────────────────────────
 
 test("only wrapper factories produce redacted-branded instances (raw services are rejected by the brand check)", () => {
   const fakeOAuth = createFakeOAuthService();
   const fakeSettings = createFakeProviderSettingsService(buildProviderSettingsView());
+  const fakeCredential = createFakeCredentialService();
   assert.equal(isRemoteBridgeRedactedService(fakeOAuth), false);
   assert.equal(isRemoteBridgeRedactedService(fakeSettings), false);
+  assert.equal(isRemoteBridgeRedactedService(fakeCredential), false);
   assert.equal(isRemoteBridgeRedactedService(createReadOnlyOAuthService(fakeOAuth)), true);
   assert.equal(
     isRemoteBridgeRedactedService(createRedactedProviderSettingsService(fakeSettings)),
+    true,
+  );
+  assert.equal(
+    isRemoteBridgeRedactedService(createReadOnlyCredentialService(fakeCredential)),
     true,
   );
 });
@@ -413,29 +589,32 @@ test("every bridge whitelist channel has an explicit wrapped/raw ruling (structu
     assert.notEqual(ruling, "forbidden", `${descriptor.channelName} must not be forbidden`);
     rulings[descriptor.channelName] = ruling;
   }
-  // 凭据邻接四通道的裁决：credential/provisioning-target 禁；oauth/provider-settings 只许 wrapped。
-  assert.equal(resolveRemoteBridgeChannelRuling("credential"), "forbidden");
+  // 凭据邻接通道裁决：provisioning-target 禁；oauth/provider-settings/credential 只许 wrapped。
   assert.equal(resolveRemoteBridgeChannelRuling("provider-provisioning-target"), "forbidden");
   assert.equal(resolveRemoteBridgeChannelRuling(IOAuthService.channelName), "wrapped");
   assert.equal(resolveRemoteBridgeChannelRuling(IProviderSettingsService.channelName), "wrapped");
+  assert.equal(resolveRemoteBridgeChannelRuling(ICredentialService.channelName), "wrapped");
   assert.equal(resolveRemoteBridgeChannelRuling("model-selection"), "wrapped");
   assert.equal(rulings["oauth"], "wrapped");
   assert.equal(rulings["provider-settings"], "wrapped");
+  assert.equal(rulings["credential"], "wrapped");
   assert.equal(rulings["setting"], "raw");
   assert.equal(resolveRemoteBridgeChannelRuling("git"), "unruled");
   // 原版 UI 按 channel name 取服务：包装注册必须落在同名通道上。
   assert.equal(IOAuthService.channelName, "oauth");
   assert.equal(IProviderSettingsService.channelName, "provider-settings");
+  assert.equal(ICredentialService.channelName, "credential");
 });
 
 // ── relay：方法级第二道墙与两侧镜像 ──────────────────────────────────────────
 
-test("relay keeps credential channels forbidden and proxies the two wrapped channels", () => {
+test("relay keeps provider-provisioning-target forbidden and proxies the three wrapped channels", () => {
   const whitelist = DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST.map((d) => d.channelName);
   const forbidden = RELAY_FORBIDDEN_DEVICE_SERVICES.map((d) => d.channelName);
   assert.equal(whitelist.includes("oauth"), true);
   assert.equal(whitelist.includes("provider-settings"), true);
-  assert.deepEqual(forbidden, ["credential", "provider-provisioning-target"]);
+  assert.equal(whitelist.includes("credential"), true);
+  assert.deepEqual(forbidden, ["provider-provisioning-target"]);
   for (const name of forbidden) {
     assert.equal(whitelist.includes(name), false, `relay whitelist must not include ${name}`);
   }
@@ -454,6 +633,8 @@ test("relay read-only method wall mirrors the device-side wrapper read surface",
     "onDidChange",
     "refresh",
   ]);
+  // credential：relay 只放 load（键策略在设备侧包装内裁决，relay 不重复键级逻辑）。
+  assert.deepEqual([...RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS["credential"]!], ["load"]);
   // 镜像的每个方法在设备包装上必须是真实存在的函数成员。
   const oauth = createReadOnlyOAuthService(createFakeOAuthService()) as unknown as Record<
     string,
@@ -471,5 +652,11 @@ test("relay read-only method wall mirrors the device-side wrapper read surface",
       "function",
       `provider-settings wrapper must expose ${method}`,
     );
+  }
+  const credential = createReadOnlyCredentialService(
+    createFakeCredentialService(),
+  ) as unknown as Record<string, unknown>;
+  for (const method of RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS["credential"]!) {
+    assert.equal(typeof credential[method], "function", `credential wrapper must expose ${method}`);
   }
 });

@@ -15,21 +15,23 @@
  * 1. `REMOTE_BRIDGE_SERVICE_WHITELIST` + `registerWhitelistedChannels` 是【唯一】注册面，
  *    且每个成员必须显式裁决为 wrapped 或 raw（`assertWhitelistExcludesForbiddenServices`
  *    启动即校验的结构化裁决，新服务入桥必须二选一并落表）：
- *    - credential / provider-provisioning-target 永不放行（双侧硬禁）；
- *    - IOAuthService / IProviderSettingsService / IModelSelectionService 是 wrapped-only：
- *      只能经 `REMOTE_BRIDGE_REDACTED_CHANNELS` 的脱敏包装注册，`registerRedactedChannel`
- *      的 brand 校验让 raw 实例注册即 fail。
+ *    - provider-provisioning-target 永不放行（双侧硬禁）；
+ *    - IOAuthService / IProviderSettingsService / IModelSelectionService /
+ *      ICredentialService 是 wrapped-only：只能经 `REMOTE_BRIDGE_REDACTED_CHANNELS`
+ *      的脱敏包装注册，`registerRedactedChannel` 的 brand 校验让 raw 实例注册即 fail。
  * 2. wrapped 通道的读面约束：modelSelection/provider-settings 的 view 携带两类凭据——
  *    access 的明文 apiKey/apiKeyManagementUrl 与 api.headers 的 header 型凭据
  *    （provider/src/resolver.ts serializeRegistryProviderConfig 直传），响应与
  *    onDidChange 事件一律 strip 后才出设备（redactModelSelectionView /
  *    redactProviderSettingsView）；oauth 只放观察读（登录展示态经设备侧
- *    peekCachedSessionState 无副作用合成，见 createReadOnlyOAuthService）。
+ *    peekCachedSessionState 无副作用合成，见 createReadOnlyOAuthService）；
+ *    credential 只放键策略读（见 createReadOnlyCredentialService：active_provider/
+ *    user_info 原值，token 类键只回存在性占位，其余键拒绝）。
  *    读侧直通错误一律消毒（丢 stack/passthrough 字段，见 sanitizeRemoteReadError）。
  * 3. 本模块绝不使用 ServiceCollection.exposeOnChannelServer（全量无差别暴露，
  *    services/src/collection.ts:34-40）。
  * 4. 双层信任模型（security review Major 1）：host 包装是第一道（脱敏/只读，防本设备
- *    凭据出网）；relay 对 oauth/provider-settings 的方法级过滤是第二道
+ *    凭据出网）；relay 对 oauth/provider-settings/credential 的方法级过滤是第二道
  *    （server/src/relay.ts RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS，防共享 enroll token
  *    的冒充主机注册 raw 服务后经原版 UI 写路径收割凭据）。两道各自独立生效。
  */
@@ -46,6 +48,7 @@ import {
 } from "@zcode/rpc";
 import {
   IBroadcastService,
+  ICredentialService,
   IFileService,
   IModelSelectionService,
   IOAuthService,
@@ -91,7 +94,8 @@ interface RemoteBridgeLogger {
  * - IZCodeSessionService / IZCodeTaskService：会话读取/状态与任务列表/元数据。
  * - IFileService / ITerminalService：文件树/附件兜底 + 终端面板（K3 硬验收项）。
  * - IBroadcastService：缺=纯降级但零风险，StoreProvider/IntlProvider 语义前提。
- * - IModelSelectionService / IOAuthService / IProviderSettingsService：wrapped-only（见下）。
+ * - IModelSelectionService / IOAuthService / IProviderSettingsService / ICredentialService：
+ *   wrapped-only（见下）。
  * IGitService / ISystemService 未入（缺=降级不挂，K2 实测），保持排除收窄审查面。
  * 每个成员必须落在 REMOTE_BRIDGE_REDACTED_CHANNELS（wrapped）或
  * REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES（raw）之一，否则启动即 fail——新服务入桥
@@ -108,20 +112,19 @@ export const REMOTE_BRIDGE_SERVICE_WHITELIST: readonly ServiceDescriptor<unknown
   IModelSelectionService,
   IOAuthService,
   IProviderSettingsService,
+  ICredentialService,
 ];
 
 /**
  * 永不放行的凭据邻接通道（双侧硬禁，任何注册形态都不允许）：
- * credential / provider-provisioning-target。channelName 用字符串镜像（shared/src/
+ * provider-provisioning-target。channelName 用字符串镜像（shared/src/
  * channels.ts ServiceChannels）而非 import 描述符，防止“顺手加回来”式回归；
  * 与 server/src/relay.ts RELAY_FORBIDDEN_DEVICE_SERVICES 互为两侧双保险。
- * oauth / provider-settings 属于 wrapped-only：允许出现在主清单，但只能经
- * REMOTE_BRIDGE_REDACTED_CHANNELS 的脱敏包装注册（裁决断言 + brand 校验双层强制）。
+ * oauth / provider-settings / credential 属于 wrapped-only：允许出现在主清单，
+ * 但只能经 REMOTE_BRIDGE_REDACTED_CHANNELS 的脱敏包装注册（裁决断言 + brand
+ * 校验双层强制）。
  */
-const REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES: readonly string[] = [
-  "credential",
-  "provider-provisioning-target",
-];
+const REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES: readonly string[] = ["provider-provisioning-target"];
 
 /** raw 直注册显式允许清单：不在此列且非 wrapped 的主清单成员会让启动 fail。 */
 const REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES: readonly string[] = [
@@ -510,6 +513,74 @@ export function createRedactedProviderSettingsService(
   });
 }
 
+// ── credential：键策略只读（E2E 第三缺口：原版设置页打开时的 3 条 credential.load）──
+
+/** presence 键的真值替代串：真值非空时回此占位，真 token 绝不出设备。 */
+export const REMOTE_BRIDGE_CREDENTIAL_PRESENT_PLACEHOLDER = "redacted-present";
+
+/**
+ * token 类键（值本身即机密）：oauth 派生 token 按 services/src/oauth/repo/
+ * oauthCredentialRepo 的 key 形状 + purchase_token 预留段；zcodejwttoken 是
+ * 官网购买页通用 JWT（packages/ui getCodingPlanCredentialKeys）。只回存在性占位。
+ */
+const REMOTE_BRIDGE_CREDENTIAL_TOKEN_KEY_PATTERN =
+  /^oauth:[a-z0-9-]+:(access_token|refresh_token|id_token|purchase_token)$/;
+/** 展示载荷键：user_info 是登录展示 profile（oauth 通道 peek 已在服务等价信息）。 */
+const REMOTE_BRIDGE_CREDENTIAL_USER_INFO_KEY_PATTERN = /^oauth:[a-z0-9-]+:user_info$/;
+
+/**
+ * credential.load 的逐键裁决（deny-first，导出供表驱动断言/单测）：
+ * - "passthrough"：原值返回——active_provider 是 provider id 选择器、user_info 是
+ *   展示载荷，均非机密；
+ * - "presence"：真值非空→固定占位串、空/null→null——packages/ui 的 token 消费方
+ *   全部只做 `.trim().length > 0` 存在性判断或稳定等值比较（见调用点表格，
+ *   ModelProviderSection/useCodingPlanEntryPlanList/CodingPlanEmbeddedWebviewDialog），
+ *   占位串对它们语义等价；
+ * - null：其余键（bot:、web-remote-control:、account-provider:、remote-workspace:、
+ *   legacy auth_token 等一切）拒绝——deny-first，白名单外的键不允许经桥探测/读取。
+ */
+export type RemoteBridgeCredentialKeyRuling = "passthrough" | "presence";
+
+export function resolveRemoteBridgeCredentialKeyRuling(
+  key: string,
+): RemoteBridgeCredentialKeyRuling | null {
+  if (key === "oauth:active_provider" || REMOTE_BRIDGE_CREDENTIAL_USER_INFO_KEY_PATTERN.test(key)) {
+    return "passthrough";
+  }
+  if (key === "zcodejwttoken" || REMOTE_BRIDGE_CREDENTIAL_TOKEN_KEY_PATTERN.test(key)) {
+    return "presence";
+  }
+  return null;
+}
+
+/**
+ * ICredentialService 的键策略只读包装（通道名 "credential"，原版 UI 零改动取用）。
+ * load 先裁键再触底（deny-first：白名单外的键在设备侧就拒绝，不构成存在性预言机）；
+ * token 类键绝不返回真值；save/delete 全部抛错——写面只剩 reject，配合 relay 侧
+ * credential:["load"] 方法墙构成双道防线。读侧直通错误消毒同其它 wrapped 通道。
+ */
+export function createReadOnlyCredentialService(service: ICredentialService): ICredentialService {
+  return markRedacted<ICredentialService>({
+    load: async (key) => {
+      const ruling = resolveRemoteBridgeCredentialKeyRuling(key);
+      if (!ruling) {
+        throw new Error(
+          `credential.load key '${key}' is not available on the remote bridge (read-only key policy)`,
+        );
+      }
+      const value = await readThroughSanitized(() => service.load(key));
+      if (ruling === "passthrough") {
+        return value;
+      }
+      return value !== null && value.trim().length > 0
+        ? REMOTE_BRIDGE_CREDENTIAL_PRESENT_PLACEHOLDER
+        : null;
+    },
+    save: () => rejectRemoteChannelMethod("credential", "save"),
+    delete: () => rejectRemoteChannelMethod("credential", "delete"),
+  });
+}
+
 /** wrapped-only 通道注册表：descriptor 只用来取实例与 channel 名，包装工厂是唯一产物来源。 */
 interface RemoteBridgeRedactedChannelRegistration {
   readonly descriptor: ServiceDescriptor<object>;
@@ -535,12 +606,13 @@ const REMOTE_BRIDGE_REDACTED_CHANNELS: readonly RemoteBridgeRedactedChannelRegis
   defineRedactedChannel(IModelSelectionService, createRedactedModelSelectionService),
   defineRedactedChannel(IOAuthService, createReadOnlyOAuthService),
   defineRedactedChannel(IProviderSettingsService, createRedactedProviderSettingsService),
+  defineRedactedChannel(ICredentialService, createReadOnlyCredentialService),
 ];
 
 /**
  * wrapped-only 通道的唯一 registerChannel 入口：实例必须带包装 brand（只有本文件的
- * 脱敏工厂会打标）。raw IOAuthService/IProviderSettingsService 流入这里会在注册时
- * 立即 throw——桥按连接注册，等价于启动即 fail。
+ * 脱敏工厂会打标）。raw IOAuthService/IProviderSettingsService/ICredentialService
+ * 流入这里会在注册时立即 throw——桥按连接注册，等价于启动即 fail。
  */
 export function registerRedactedChannel(
   server: ChannelServer,

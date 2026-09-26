@@ -9,7 +9,7 @@ import {
 
 /**
  * 方法级第二道墙（security review Major 1）：冒充主机可在设备侧注册 raw 服务，
- * 但网页客户端只经 relay 取这两条通道——成员表外的调用必须在 relay 的
+ * 但网页客户端只经 relay 取这三条通道——成员表外的调用必须在 relay 的
  * ChannelServer（ProxyChannel.fromService.call）被拒，且绝不转发给主机。
  */
 
@@ -105,9 +105,30 @@ test("oauth wall forwards dry reads and blocks flows/mutations at the relay", as
   assert.deepEqual(recording.forwardedCalls, ["getActiveProvider", "restoreCachedSessionState"]);
 });
 
-test("read-only wall covers exactly the two wrapped channels in the relay whitelist", () => {
+test("credential wall forwards load only and blocks save/delete at the relay", async () => {
+  const recording = createRecordingChannel({ load: "redacted-present" });
+  const filtered = createRelayReadOnlyDeviceService<object>(recording.channel, "credential");
+  const serverChannel = ProxyChannel.fromService(filtered);
+
+  // 只放 load：键策略（原值/占位/拒绝）在设备侧包装内裁决，relay 不重复键级逻辑。
+  assert.equal(
+    await serverChannel.call("ctx", "load", ["oauth:active_provider"]),
+    "redacted-present",
+  );
+  // 冒充主机的收割面：credential.save/delete（录任意键值/清库）必须在 relay 拒绝。
+  for (const method of ["save", "delete"]) {
+    assert.throws(
+      () => serverChannel.call("ctx", method, ["oauth:zai:access_token", "captured"]),
+      /Method not found/,
+      `${method} must be rejected at the relay`,
+    );
+  }
+  assert.deepEqual(recording.forwardedCalls, ["load"], "writes must never reach the host");
+});
+
+test("read-only wall covers exactly the three wrapped channels in the relay whitelist", () => {
   const wallChannels = Object.keys(RELAY_DEVICE_READ_ONLY_CHANNEL_METHODS).sort();
-  assert.deepEqual(wallChannels, ["oauth", "provider-settings"]);
+  assert.deepEqual(wallChannels, ["credential", "oauth", "provider-settings"]);
   for (const channelName of wallChannels) {
     assert.equal(
       DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST.some((d) => d.channelName === channelName),
