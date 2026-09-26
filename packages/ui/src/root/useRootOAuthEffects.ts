@@ -92,6 +92,7 @@ async function handleOAuthCallbackSuccess(params: {
 }
 
 export function useRootOAuthEffects({
+  enabled = true,
   accountIntentKey,
   platform,
   services,
@@ -105,6 +106,8 @@ export function useRootOAuthEffects({
   markOAuthSuccess,
   onReauthenticationRequired,
 }: {
+  /** 远控 Web 挂载形态传 false：oauth channel 是桥的硬排除项，登录态恢复/轮询一律不发起。 */
+  enabled?: boolean;
   accountIntentKey: string;
   platform: IPlatformService;
   services: IServiceAccessor;
@@ -118,7 +121,9 @@ export function useRootOAuthEffects({
   markOAuthSuccess: (provider?: OAuthProviderId) => void;
   onReauthenticationRequired: () => void;
 }) {
-  useAccountConnectionLossNotification(services, accountIntentKey, refreshAppSettings);
+  useAccountConnectionLossNotification(services, accountIntentKey, refreshAppSettings, {
+    enabled,
+  });
   const requestAlert = useAlertDialog();
   const { intl } = useZCodeIntl();
   const oauthLoginSucceededRef = useRef(false);
@@ -126,6 +131,14 @@ export function useRootOAuthEffects({
   const oauthLoginSuccessOwnerRef = useRef<"polling" | "deep-link" | null>(null);
 
   useEffect(() => {
+    // 远控挂载形态：用户信息数据源是 IOAuthService.restoreCachedSessionState() 的缓存
+    // user_info——凭据邻接（oauth channel 桥上硬排除），这里不发起调用，footer 账号区
+    // 由 remoteWebSessionStore 标记整体隐藏。仍必须立刻落定恢复态，否则
+    // isRestoringOAuthSession 会把 workspace 会话恢复门禁永久卡在启动 loading。
+    if (!enabled) {
+      setIsRestoringOAuthSession(false);
+      return;
+    }
     let disposed = false;
     async function restoreOAuthSessionInBackground() {
       logger.info("[Root] 后台启动 OAuth 本地会话恢复");
@@ -190,6 +203,7 @@ export function useRootOAuthEffects({
       disposed = true;
     };
   }, [
+    enabled,
     intl,
     onReauthenticationRequired,
     refreshAppSettings,
@@ -201,6 +215,11 @@ export function useRootOAuthEffects({
   ]);
 
   useEffect(() => {
+    // 远控形态不订阅 JWT 失效广播：重登/重启动作只对设备本机会话有意义，远端浏览器
+    // 既无法代设备完成 OAuth，reload 也只是重挂载同一份设备事实。
+    if (!enabled) {
+      return;
+    }
     let disposed = false;
     const disposable = services.broadcastService.onMessage((message) => {
       if (message.channel !== ZCODE_JWT_INVALID_BROADCAST_CHANNEL || disposed) {
@@ -232,10 +251,17 @@ export function useRootOAuthEffects({
       disposed = true;
       disposable.dispose();
     };
-  }, [intl, onReauthenticationRequired, platform, requestAlert, services.broadcastService]);
+  }, [
+    enabled,
+    intl,
+    onReauthenticationRequired,
+    platform,
+    requestAlert,
+    services.broadcastService,
+  ]);
 
   useEffect(() => {
-    if (!oauthPollingActive) {
+    if (!enabled || !oauthPollingActive) {
       return;
     }
     oauthLoginSucceededRef.current = false;
@@ -307,6 +333,7 @@ export function useRootOAuthEffects({
       window.clearInterval(pollTimer);
     };
   }, [
+    enabled,
     intl,
     markOAuthSuccess,
     oauthPollingActive,
@@ -320,6 +347,9 @@ export function useRootOAuthEffects({
   ]);
 
   useEffect(() => {
+    if (!enabled) {
+      return;
+    }
     const disposeOAuth = platform.onOAuthCallback(async (url) => {
       try {
         const result = await services.oauthService.handleCallback(url);
@@ -396,6 +426,7 @@ export function useRootOAuthEffects({
       disposeOAuth();
     };
   }, [
+    enabled,
     intl,
     platform,
     refreshAppSettings,

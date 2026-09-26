@@ -14,6 +14,7 @@ export function useAccountConnectionLossNotification(
   services: IServiceAccessor,
   intentKey: string,
   refreshAppSettings?: () => Promise<void>,
+  { enabled = true }: { enabled?: boolean } = {},
 ) {
   const { intl } = useZCodeIntl();
   const latest = useRef({ intl, refreshAppSettings });
@@ -29,6 +30,12 @@ export function useAccountConnectionLossNotification(
     noticeRef.current = null;
   }, [intentKey]);
   useEffect(() => {
+    // 远控挂载形态：观察源 providerSettingsService 在桥上硬排除（凭据邻接），订阅/
+    // getView 只会以 1000ms 超时回绝。这里不建立观察——连接失效提示属于设备本机账号
+    // 语义，远端浏览器既拿不到账号事实也无法代为切换。
+    if (!enabled) {
+      return;
+    }
     const observer = createAccountConnectionRefreshObserver(async (event) => {
       let suggestion: Awaited<ReturnType<typeof prepareAccountConnectionSwitch>> = null;
       try {
@@ -130,5 +137,5 @@ export function useAccountConnectionLossNotification(
       if (noticeRef.current) dismissToast(noticeRef.current.id);
       noticeRef.current = null;
     };
-  }, [services]);
+  }, [enabled, services]);
 }

@@ -28,7 +28,12 @@ import {
   isConversationSharePath,
   resolveConversationShareCodeFromPath,
 } from "./share/conversationShareRoute.js";
-import type { IPlatformService, RemoteTarget, ServerRemoteInfo } from "@zcode/shared";
+import type {
+  IPlatformService,
+  RemoteTarget,
+  ServerRemoteInfo,
+  ServerRemoteWorkspaceInfo,
+} from "@zcode/shared";
 import { WEB_DEFAULT_THEME, resolveWebInitialTheme } from "./webThemeSeed.js";
 
 function resolveWebThemePreference(defaultTheme: Theme = WEB_DEFAULT_THEME): Theme {
@@ -87,6 +92,8 @@ interface WebBootstrapResult {
   allowOpenWorkspace?: boolean;
   /** ?remote=<deviceId> 远控挂载形态：跳过设备首跑职业引导（Root 侧消费）。 */
   isRemoteWebSession?: boolean;
+  /** 远控形态的设备工作区列表（server-info workspaces 投影，侧栏切换区数据源）。 */
+  remoteWebWorkspaces?: ServerRemoteWorkspaceInfo[];
 }
 
 function isWebOAuthCallback(params: URLSearchParams): boolean {
@@ -388,6 +395,9 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
       return {
         wsUrl,
         isRemoteWebSession: true,
+        ...(Array.isArray(serverInfo.workspaces)
+          ? { remoteWebWorkspaces: serverInfo.workspaces }
+          : {}),
         ...(workspace?.path ? { initialWorkspaceAbsPath: workspace.path } : {}),
         ...(workspace?.workspaceIdentity
           ? { initialWorkspaceIdentity: workspace.workspaceIdentity }
@@ -495,6 +505,7 @@ async function bootstrapWebApp() {
             restoreSession={bootstrap.restoreSession}
             allowOpenWorkspace={bootstrap.allowOpenWorkspace}
             remoteWebSession={bootstrap.isRemoteWebSession}
+            remoteWebWorkspaces={bootstrap.remoteWebWorkspaces}
             preferDirectoryBrowser
             supportsEmbeddedBrowser={false}
             allowRemoteWorkspace={false}

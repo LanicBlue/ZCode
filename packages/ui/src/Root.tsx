@@ -34,6 +34,7 @@ import {
   shouldOpenFallbackWorkspaceAfterCreate,
 } from "@/lib/rootStartupGate.js";
 import { StoreProvider, useZCodeStore } from "@/store/StoreProvider.js";
+import { useRemoteWebSessionStore } from "@/store/remoteWebSessionStore.js";
 import { setMcpStorePlatform } from "@/store/mcpStore.js";
 import { useZCodeSessionStore } from "@/store/zcodeSessionStore.js";
 import { TabStoreProvider, useTabStore, useTabStoreApi } from "@/store/TabStoreProvider.js";
@@ -159,8 +160,21 @@ function RootInner({
   supportsEmbeddedBrowser: explicitSupportsEmbeddedBrowser,
   allowRemoteWorkspace = true,
   remoteWebSession = false,
+  remoteWebWorkspaces,
   initialWorkspaceLoadingFallback,
 }: RootProps) {
+  // 远控 Web 会话事实写入模块 store（账号区隐藏、设备工作区切换区等深层 UI 消费，
+  // 见 store/remoteWebSessionStore.ts 头注释）。非远控形态显式置 false，保证同窗口
+  // 内 HMR/重挂载不会残留上一形态的标记。
+  useEffect(() => {
+    if (!remoteWebSession) {
+      useRemoteWebSessionStore.getState().setRemoteWebSession({ enabled: false });
+      return;
+    }
+    useRemoteWebSessionStore
+      .getState()
+      .setRemoteWebSession({ enabled: true, deviceWorkspaces: remoteWebWorkspaces ?? [] });
+  }, [remoteWebSession, remoteWebWorkspaces]);
   useEffect(() => {
     setMcpStorePlatform(platform);
     // 对话 UI perf 只属于 desktop-continuous；Web/mobile 即使能看到权威状态也不装 reporter。
@@ -386,12 +400,26 @@ function RootInner({
   const addTab = useTabStore((state) => state.addTab);
   const activateTabByPath = useTabStore((state) => state.activateTabByPath);
   const tabStoreApi = useTabStoreApi();
-  const refreshProviderState = useRootProviderStateRefresh(services);
-  useRootProviderSettingsSnapshot(services);
+  const refreshProviderState = useRootProviderStateRefresh(services, {
+    enabled: !remoteWebSession,
+  });
+  // 远控挂载形态：provider-settings 是桥的硬排除项（凭据邻接，remoteBridge.ts
+  // REMOTE_BRIDGE_FORBIDDEN_CHANNEL_NAMES）。这里不连接快照——订阅/getView 一旦发出，
+  // 中继侧只会以 1000ms 超时回绝并把 "Unknown channel: provider-settings" 打进 relay 日志。
+  // 快照停留在 loading 态，footer 徽标/额度横幅/工具栏等消费方按既有 loading 语义隐藏。
+  useRootProviderSettingsSnapshot(services, { enabled: !remoteWebSession });
   useEffect(() => {
     let disposed = false;
 
     void (async () => {
+      // provider family domain 迁移要读 oauthService.getActiveProvider（凭据邻接，
+      // 远控形态不可达）；迁移本身是设备本机首跑流程，桌面端自己会做，远端浏览器不代答。
+      if (remoteWebSession) {
+        if (!disposed) {
+          setProviderFamilyDomainMigrationComplete(true);
+        }
+        return;
+      }
       try {
         await ensureProviderFamilyDomainMigration(services);
       } catch (error) {
@@ -416,7 +444,7 @@ function RootInner({
     return () => {
       disposed = true;
     };
-  }, [refreshAppSettings, refreshProviderState, services]);
+  }, [refreshAppSettings, refreshProviderState, remoteWebSession, services]);
 
   const shouldPreferDirectoryBrowser = Boolean(preferDirectoryBrowser);
   const supportsEmbeddedBrowser = explicitSupportsEmbeddedBrowser ?? Boolean(isDesktop);
@@ -696,6 +724,9 @@ function RootInner({
   }, [platform]);
 
   useRootOAuthEffects({
+    // 远控挂载形态：oauth channel 桥上硬排除（凭据邻接），登录态恢复/轮询/回调一律
+    // 不发起，hook 内部直接落定 isRestoringOAuthSession=false 放行会话恢复。
+    enabled: !remoteWebSession,
     accountIntentKey: JSON.stringify([
       user?.id,
       appSettings?.providerFamilyDomain,

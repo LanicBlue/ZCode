@@ -1509,6 +1509,7 @@ const zhCN: Record<string, string> = {
   "workspaceSidebar.addProject": "添加项目",
   "workspaceSidebar.noConversations": "还没有任务",
   "workspaceSidebar.noProjects": "尚未打开项目",
+  "workspaceSidebar.deviceWorkspaces": "设备上的其他工作区",
   "workspaceSidebar.viewByWorkspace": "按项目",
   "workspaceSidebar.organizeChronologicalList": "时间线",
   "workspaceSidebar.sortBy": "排序方式",
