@@ -3,13 +3,10 @@ import type { IServiceAccessor } from "@zcode/services";
 import { connectProviderSettingsSnapshot } from "@/lib/providerSettingsSnapshot.js";
 import { logger } from "@/logger.js";
 
-export function useRootProviderSettingsSnapshot(
-  services: IServiceAccessor,
-  { enabled = true }: { enabled?: boolean } = {},
-): void {
+export function useRootProviderSettingsSnapshot(services: IServiceAccessor): void {
   useEffect(() => {
     const service = services.providerSettingsService;
-    if (!service || !enabled) return;
+    if (!service) return;
 
     const connection = connectProviderSettingsSnapshot(service);
     void connection.ready.catch((error) => {
@@ -18,5 +15,5 @@ export function useRootProviderSettingsSnapshot(
       });
     });
     return () => connection.dispose();
-  }, [enabled, services.providerSettingsService]);
+  }, [services.providerSettingsService]);
 }

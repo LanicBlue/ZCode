@@ -197,12 +197,6 @@ export const TID_WORKSPACE_LIST = "workspace-list";
 export const TID_WORKSPACE_ITEM = "workspace-item";
 /** 侧边栏关闭工作区按钮（动态后缀为 workspacePath） */
 export const TID_WORKSPACE_CLOSE = "workspace-close";
-/** 工作区行“新建对话”按钮（动态后缀为 workspacePath；同时是切到该工作区的入口） */
-export const TID_WORKSPACE_NEW_THREAD = "workspace-new-thread";
-/** 远控 Web 会话的设备工作区切换区（列 server-info 里未打开的设备工作区） */
-export const TID_REMOTE_DEVICE_WORKSPACE_SECTION = "remote-device-workspace-section";
-/** 设备工作区切换区条目（动态后缀为设备侧 workspacePath） */
-export const TID_REMOTE_DEVICE_WORKSPACE = "remote-device-workspace";
 /** 项目视图里的对话二级分区 */
 export const TID_CONVERSATION_SECTION = "conversation-section";
 /** 项目视图里的项目二级分区 */

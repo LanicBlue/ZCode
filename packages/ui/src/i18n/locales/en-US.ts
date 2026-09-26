@@ -1625,7 +1625,6 @@ const enUS: Record<string, string> = {
   "workspaceSidebar.addProject": "Add project",
   "workspaceSidebar.noConversations": "No tasks yet",
   "workspaceSidebar.noProjects": "No open projects",
-  "workspaceSidebar.deviceWorkspaces": "More workspaces on this device",
   "workspaceSidebar.viewByWorkspace": "By project",
   "workspaceSidebar.organizeChronologicalList": "Timeline",
   "workspaceSidebar.sortBy": "Sort by",

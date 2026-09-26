@@ -13,17 +13,6 @@ async function refreshRootProviderState(services: RootProviderStateServices): Pr
   }
 }
 
-export function useRootProviderStateRefresh(
-  services: IServiceAccessor,
-  { enabled = true }: { enabled?: boolean } = {},
-) {
-  return useCallback(async () => {
-    // 远控挂载形态（enabled=false）：providerSettingsService.refresh 只会在桥上
-    // 1000ms 超时，这里直接吞掉调用，避免把 "Unknown channel: provider-settings"
-    // 打进中继日志。返回已完成的 Promise 保持调用方 await 语义不变。
-    if (!enabled) {
-      return;
-    }
-    await refreshRootProviderState(services);
-  }, [enabled, services.providerSettingsService]);
+export function useRootProviderStateRefresh(services: IServiceAccessor) {
+  return useCallback(() => refreshRootProviderState(services), [services.providerSettingsService]);
 }

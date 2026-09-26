@@ -61,7 +61,6 @@ import {
   TID_WORKSPACE_CLOSE,
   TID_WORKSPACE_FILE_TREE_BUTTON,
   TID_WORKSPACE_ITEM,
-  TID_WORKSPACE_NEW_THREAD,
   testId,
 } from "@zcode/shared";
 import type { ZCodeTaskMeta } from "@zcode/shared";
@@ -1100,7 +1099,6 @@ export const WorkspaceSidebarItem = memo(function WorkspaceSidebarItem({
                           onMouseDown={handleActionMouseDown}
                           onClick={handleCreateThreadClick}
                           disabled={Boolean(readOnlyReason)}
-                          data-testid={testId(TID_WORKSPACE_NEW_THREAD, tab.workspacePath)}
                           aria-label={intl.formatMessage({
                             id: "taskList.newThread",
                           })}
