@@ -106,7 +106,8 @@ interface RemoteBridgeLogger {
  *   每连接经 createWindowControllerService 工厂建独立 attachment（帧 emitter + 订阅
  *   随连接销毁，复用桌面窗口 exposeServicesOnMessagePort 的 createAttachmentService）。
  * - IUsageStatsService / ICodingPlanSubscriptionService：wrapped-only（用量面板/订阅读面
- *   经设备侧代取真凭据调供应商接口后只回统计；重置/支付流全拒，见下方包装注释）。
+ *   经设备侧代取真凭据调供应商接口后只回统计；重置/支付流全拒，供应商侧读每连接
+ *   限频 + 缓存击穿旗标剥离，见下方包装注释）。
  * IGitService / ISystemService 未入（缺=降级不挂，K2 实测），保持排除收窄审查面。
  * 每个成员必须落在 REMOTE_BRIDGE_REDACTED_CHANNELS（wrapped）或
  * REMOTE_BRIDGE_RAW_ALLOWED_CHANNEL_NAMES（raw）之一，否则启动即 fail——新服务入桥
@@ -596,6 +597,67 @@ export function createReadOnlyCredentialService(service: ICredentialService): IC
   });
 }
 
+// ── 供应商侧读限频 + 缓存击穿旗标剥离（security review minor）────────────────
+
+/**
+ * 供应商侧读限频窗口（照 createRedactedProviderSettingsService 的 refresh 先例
+ * 6 次/60s 滑动窗口）：usage-stats 5 个放行读与 coding-plan-subscription 的
+ * 供应商侧读子集（preview/pricing/balance/orders/client-configs 等）会把网页调用
+ * 放大成设备 egress 与供应商配额消耗——getEntitlementSnapshot 单次还能扇出 1-3 个
+ * 供应商请求。包装实例随桥连接创建/销毁，实例内窗口即"每连接"窗口。
+ */
+const VENDOR_READ_MAX_CALLS_PER_WINDOW = 6;
+const VENDOR_READ_WINDOW_MS = 60_000;
+
+/**
+ * 每连接限频读注册表：按方法键各设一个滑动窗口；超限回放最近一次成功值
+ * （refresh 同款语义——原版 UI 的读侧自动重试不该因限频炸 toast，回放的是设备
+ * 已认可的真实响应），连一次成功值都还没有时才抛明确错误。回放缓存存的是包装层
+ * 返回值（已脱敏），重放不会把凭据面带回。
+ */
+function createRateLimitedReads(): {
+  read<T>(key: string, read: () => Promise<T>): Promise<T>;
+} {
+  const callTimestampsByKey = new Map<string, number[]>();
+  const lastValueByKey = new Map<string, unknown>();
+  return {
+    async read<T>(key: string, read: () => Promise<T>): Promise<T> {
+      const now = Date.now();
+      const timestamps = (callTimestampsByKey.get(key) ?? []).filter(
+        (timestamp) => now - timestamp < VENDOR_READ_WINDOW_MS,
+      );
+      if (timestamps.length >= VENDOR_READ_MAX_CALLS_PER_WINDOW) {
+        if (lastValueByKey.has(key)) {
+          return lastValueByKey.get(key) as T;
+        }
+        throw new Error(`${key} is rate limited on the remote bridge; retry later`);
+      }
+      timestamps.push(now);
+      callTimestampsByKey.set(key, timestamps);
+      const value = await readThroughSanitized(read);
+      lastValueByKey.set(key, value);
+      return value;
+    },
+  };
+}
+
+/**
+ * 请求旗标剥离：远控面没有主动击穿缓存的合法场景——invalidateBalanceCache
+ * （usage entitlement，使 Start Plan balance 短期缓存失效）与 forceRefresh
+ * （subscription client/configs 快照，跳过 1h 缓存）只会放大设备 egress，
+ * 一律剥掉后转发；无旗标（或为 false）的请求原引用直通。
+ */
+function stripRequestFlag<Request extends object>(
+  request: Request | undefined,
+  flag: keyof Request & string,
+): Request | undefined {
+  if (!request || request[flag] !== true) {
+    return request;
+  }
+  const { [flag]: _strippedFlag, ...rest } = request as Record<string, unknown>;
+  return rest as Request;
+}
+
 // ── usage-stats：用量只读（设备侧代取：真凭据只在设备侧用于调供应商统计接口）──
 
 /**
@@ -610,18 +672,30 @@ export function createReadOnlyCredentialService(service: ICredentialService): IC
  * 拒绝 3 个：useCodingPlanReset / requestCodingPlanResetOpportunity（供应商侧重置动作，
  * 远控不做）/ markCodingPlanResetHistoryRead（写已读状态）。抛错而不是假数据，原版 UI
  * 的失败分支自然生效（重置入口远端不可用是文档化取舍）。
+ * 全部 5 读走每连接限频窗口（见 createRateLimitedReads）；getEntitlementSnapshot
+ * 请求里的 invalidateBalanceCache 旗标剥离（远控面没有主动击穿缓存的场景）。
  */
 export function createReadOnlyUsageStatsService(service: IUsageStatsService): IUsageStatsService {
+  const vendorReads = createRateLimitedReads();
   return markRedacted<IUsageStatsService>({
     getAppUsageSnapshot: (request) =>
-      readThroughSanitized(() => service.getAppUsageSnapshot(request)),
+      vendorReads.read("usage-stats.getAppUsageSnapshot", () =>
+        service.getAppUsageSnapshot(request),
+      ),
     getCodingPlanUsageSnapshot: (request) =>
-      readThroughSanitized(() => service.getCodingPlanUsageSnapshot(request)),
+      vendorReads.read("usage-stats.getCodingPlanUsageSnapshot", () =>
+        service.getCodingPlanUsageSnapshot(request),
+      ),
     getCodingPlanResetStatus: (request) =>
-      readThroughSanitized(() => service.getCodingPlanResetStatus(request)),
-    getSnapshot: (request) => readThroughSanitized(() => service.getSnapshot(request)),
+      vendorReads.read("usage-stats.getCodingPlanResetStatus", () =>
+        service.getCodingPlanResetStatus(request),
+      ),
+    getSnapshot: (request) =>
+      vendorReads.read("usage-stats.getSnapshot", () => service.getSnapshot(request)),
     getEntitlementSnapshot: (request) =>
-      readThroughSanitized(() => service.getEntitlementSnapshot(request)),
+      vendorReads.read("usage-stats.getEntitlementSnapshot", () =>
+        service.getEntitlementSnapshot(stripRequestFlag(request, "invalidateBalanceCache")),
+      ),
     requestCodingPlanResetOpportunity: () =>
       rejectRemoteChannelMethod("usage-stats", "requestCodingPlanResetOpportunity"),
     useCodingPlanReset: () => rejectRemoteChannelMethod("usage-stats", "useCodingPlanReset"),
@@ -658,35 +732,49 @@ export function redactOffPeakClientConfig(config: OffPeakClientConfig): OffPeakC
  * / createPaypalSetupToken / subscribePaypal / createEnterpriseOrder / cancelEnterpriseOrder
  * / continueEnterpriseOrderPayment——支付流（签约/绑卡/扣款/下单/续付）远端明确不做，
  * 抛错让原版 UI 的失败分支自然生效。
+ * 14 个供应商侧读（除 getModelContextBudgetStrategy——固定常量不打网络）走每连接
+ * 限频窗口；getOffPeakClientConfig / getDynamicWorkflowClientConfig 请求里的
+ * forceRefresh 旗标剥离（client/configs 有 1h 快照缓存，远控面没有击穿缓存的场景）。
  */
 export function createReadOnlyCodingPlanSubscriptionService(
   service: ICodingPlanSubscriptionService,
 ): ICodingPlanSubscriptionService {
+  const vendorReads = createRateLimitedReads();
+  const throttled = <T>(method: string, read: () => Promise<T>): Promise<T> =>
+    vendorReads.read(`coding-plan-subscription.${method}`, read);
   return markRedacted<ICodingPlanSubscriptionService>({
-    batchPreview: (request) => readThroughSanitized(() => service.batchPreview(request)),
-    getStaticProducts: () => readThroughSanitized(() => service.getStaticProducts()),
-    getStaticTeamProducts: () => readThroughSanitized(() => service.getStaticTeamProducts()),
-    getStartPlanPreview: () => readThroughSanitized(() => service.getStartPlanPreview()),
-    getOffPeakClientConfig: async (options) =>
-      redactOffPeakClientConfig(
-        await readThroughSanitized(() => service.getOffPeakClientConfig(options)),
+    batchPreview: (request) => throttled("batchPreview", () => service.batchPreview(request)),
+    getStaticProducts: () => throttled("getStaticProducts", () => service.getStaticProducts()),
+    getStaticTeamProducts: () =>
+      throttled("getStaticTeamProducts", () => service.getStaticTeamProducts()),
+    getStartPlanPreview: () =>
+      throttled("getStartPlanPreview", () => service.getStartPlanPreview()),
+    getOffPeakClientConfig: (options) =>
+      throttled("getOffPeakClientConfig", async () =>
+        redactOffPeakClientConfig(
+          await service.getOffPeakClientConfig(stripRequestFlag(options, "forceRefresh")),
+        ),
       ),
     getDynamicWorkflowClientConfig: (options) =>
-      readThroughSanitized(() => service.getDynamicWorkflowClientConfig(options)),
+      throttled("getDynamicWorkflowClientConfig", () =>
+        service.getDynamicWorkflowClientConfig(stripRequestFlag(options, "forceRefresh")),
+      ),
     getModelContextBudgetStrategy: () =>
       readThroughSanitized(() => service.getModelContextBudgetStrategy()),
-    getForceUpdateConfig: () => readThroughSanitized(() => service.getForceUpdateConfig()),
-    productInfo: (request) => readThroughSanitized(() => service.productInfo(request)),
-    preview: (request) => readThroughSanitized(() => service.preview(request)),
+    getForceUpdateConfig: () =>
+      throttled("getForceUpdateConfig", () => service.getForceUpdateConfig()),
+    productInfo: (request) => throttled("productInfo", () => service.productInfo(request)),
+    preview: (request) => throttled("preview", () => service.preview(request)),
     getEnterprisePricing: (request) =>
-      readThroughSanitized(() => service.getEnterprisePricing(request)),
-    getEnterpriseBalance: () => readThroughSanitized(() => service.getEnterpriseBalance()),
+      throttled("getEnterprisePricing", () => service.getEnterprisePricing(request)),
+    getEnterpriseBalance: () =>
+      throttled("getEnterpriseBalance", () => service.getEnterpriseBalance()),
     calculateEnterpriseOrder: (request) =>
-      readThroughSanitized(() => service.calculateEnterpriseOrder(request)),
+      throttled("calculateEnterpriseOrder", () => service.calculateEnterpriseOrder(request)),
     getEnterprisePendingOrders: () =>
-      readThroughSanitized(() => service.getEnterprisePendingOrders()),
+      throttled("getEnterprisePendingOrders", () => service.getEnterprisePendingOrders()),
     checkEnterpriseOrderStatus: (request) =>
-      readThroughSanitized(() => service.checkEnterpriseOrderStatus(request)),
+      throttled("checkEnterpriseOrderStatus", () => service.checkEnterpriseOrderStatus(request)),
     createSign: () => rejectRemoteChannelMethod("coding-plan-subscription", "createSign"),
     updateSign: () => rejectRemoteChannelMethod("coding-plan-subscription", "updateSign"),
     checkPayment: () => rejectRemoteChannelMethod("coding-plan-subscription", "checkPayment"),
@@ -778,13 +866,52 @@ function registerRawChannel(server: ChannelServer, channelName: string, instance
 /**
  * window-controller attachment 的 RPC 面裁剪：dispose 是设备侧生命周期钩子（随桥连接
  * 销毁），不属于远端可调用的成员——留在面上等于让任一网页客户端一条 dispose 调用拆掉
- * 本连接的任务列表订阅。剥离后经 raw 入口注册，其余 7 个接口成员全放行。
+ * 本连接的任务列表订阅。剥离后经 raw 入口注册，其余 8 个接口成员全放行
+ * （deleteArchivedTask 与 deleteArchivedTasks 是两个独立方法）。
  */
 export function createWindowControllerRpcSurface(
   attachment: IWindowControllerService & { dispose(): void },
 ): IWindowControllerService {
   const { ["dispose"]: _dispose, ...rpcSurface } = attachment;
   return rpcSurface;
+}
+
+/**
+ * 桥连接的每连接资源簿：registerWhitelistedChannels 在连接注册期填充（agent
+ * connection scope / window-controller attachment），teardownConnection 的
+ * 有/无 current connection 两个分支统一经 disposeAll 收口——attachment 的帧
+ * emitter 与 Controller 订阅随连接销毁，不泄漏进下一条连接。disposeAll 清空
+ * 簿本后返回，重复调用幂等；单个成员 dispose 抛错不阻塞其余成员收口。
+ * 导出供生命周期单测直接驱动两个分支形态（security review note）。
+ */
+export function createRemoteBridgeConnectionResources() {
+  const agentScopes: Array<{ dispose(): Promise<void> }> = [];
+  const windowControllerAttachments: Array<{ dispose(): void }> = [];
+  return {
+    agentScopes,
+    windowControllerAttachments,
+    async disposeAll(): Promise<void> {
+      const scopes = agentScopes.splice(0, agentScopes.length);
+      for (const scope of scopes) {
+        try {
+          await scope.dispose();
+        } catch {
+          // scope dispose 失败不影响收口。
+        }
+      }
+      const attachments = windowControllerAttachments.splice(
+        0,
+        windowControllerAttachments.length,
+      );
+      for (const attachment of attachments) {
+        try {
+          attachment.dispose();
+        } catch {
+          // attachment dispose 失败不影响收口。
+        }
+      }
+    },
+  };
 }
 
 // ── ws → ISocket 适配（与 server/src/http.ts wrapWebSocket 同形，客户端方向）──
@@ -948,33 +1075,16 @@ export async function startRemoteBridge(options: {
   let connection: BridgeConnection | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let attempt = 0;
-  /** 当前连接专属的 agent connection scopes（随连接销毁）。 */
-  let agentScopes: Array<{ dispose(): Promise<void> }> = [];
-  /** 当前连接专属的 window-controller attachments（帧 emitter+订阅，随连接销毁）。 */
-  let windowControllerAttachments: Array<{ dispose(): void }> = [];
+  /** 当前连接专属资源（agent scopes + window-controller attachments），随连接销毁。 */
+  const connectionResources = createRemoteBridgeConnectionResources();
 
   const teardownConnection = async (): Promise<void> => {
     const current = connection;
     connection = null;
-    const scopes = agentScopes;
-    agentScopes = [];
-    const attachments = windowControllerAttachments;
-    windowControllerAttachments = [];
+    // 有/无 current connection 两分支共用同一收口：attachments/scopes 永远随
+    // teardown 释放（见 createRemoteBridgeConnectionResources）。
     if (!current) {
-      for (const scope of scopes) {
-        try {
-          await scope.dispose();
-        } catch {
-          // scope dispose 失败不影响收口。
-        }
-      }
-      for (const attachment of attachments) {
-        try {
-          attachment.dispose();
-        } catch {
-          // attachment dispose 失败不影响收口。
-        }
-      }
+      await connectionResources.disposeAll();
       return;
     }
     try {
@@ -987,20 +1097,7 @@ export async function startRemoteBridge(options: {
     } catch (error) {
       log.warn("[remote-bridge] channel server dispose failed:", error);
     }
-    for (const scope of scopes) {
-      try {
-        await scope.dispose();
-      } catch {
-        // 同上。
-      }
-    }
-    for (const attachment of attachments) {
-      try {
-        attachment.dispose();
-      } catch {
-        // 同上。
-      }
-    }
+    await connectionResources.disposeAll();
     try {
       current.protocol.dispose();
     } catch {
@@ -1023,7 +1120,7 @@ export async function startRemoteBridge(options: {
     for (const descriptor of REMOTE_BRIDGE_SERVICE_WHITELIST) {
       // window-controller：raw 裁决成员的连接期编排特例（非脱敏包装）。实例不来自
       // services 集合——每连接经工厂建独立 attachment（帧 emitter + Controller 订阅），
-      // 挂进 windowControllerAttachments 随连接销毁；RPC 面经
+      // 挂进 connectionResources 随连接销毁；RPC 面经
       // createWindowControllerRpcSurface 剥离设备侧 dispose 钩子后注册。
       if (descriptor === IWindowControllerService) {
         const createAttachment = options.createWindowControllerService;
@@ -1032,7 +1129,7 @@ export async function startRemoteBridge(options: {
           continue;
         }
         const attachment = createAttachment();
-        windowControllerAttachments.push(attachment);
+        connectionResources.windowControllerAttachments.push(attachment);
         registerRawChannel(
           server,
           descriptor.channelName,
@@ -1060,7 +1157,7 @@ export async function startRemoteBridge(options: {
           clientMode: "desktop-continuous",
           role: "trusted-host-relay",
         });
-        agentScopes.push(scope);
+        connectionResources.agentScopes.push(scope);
         // V4 command 经桥落一条设备侧留痕日志：K3 E2E 用它佐证「会话确在桌面应用内
         // 执行」，也让远控触发的会话活动在设备日志里可审计（此前整条链路零输出）。
         const scopedAgentService = scope.service;

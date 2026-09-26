@@ -8,6 +8,7 @@ import {
   createReadOnlyOAuthService,
   createReadOnlyUsageStatsService,
   createRedactedProviderSettingsService,
+  createRemoteBridgeConnectionResources,
   createWindowControllerRpcSurface,
   isRemoteBridgeRedactedService,
   redactOffPeakClientConfig,
@@ -821,7 +822,7 @@ test("coding-plan-subscription read errors are sanitized (no device stack)", asy
 
 // ── window-controller：raw 暴露、7 接口成员全放行、生命周期钩子不出网 ────────
 
-test("window-controller rpc surface keeps all 7 interface members and strips the device-side dispose hook", () => {
+test("window-controller rpc surface keeps all 8 interface members and strips the device-side dispose hook", () => {
   let disposed = 0;
   const attachment = {
     listTaskList: async () => ({ items: [], total: 0, hasMore: false }),
@@ -856,6 +857,162 @@ test("window-controller rpc surface keeps all 7 interface members and strips the
   assert.equal("dispose" in rpcSurface, false);
   assert.equal(rpcSurface.dispose, undefined);
   assert.equal(disposed, 0);
+});
+
+// ── 供应商侧读限频 + 缓存击穿旗标剥离（security review minor）────────────────
+
+test("usage-stats reads are rate limited per wrapper instance and replay the last snapshot", async () => {
+  const fake = createFakeUsageStatsService();
+  let underlyingCalls = 0;
+  fake.getSnapshot = async () => {
+    underlyingCalls += 1;
+    return { range: "7d", generatedAt: underlyingCalls } as never;
+  };
+  const wrapped = createReadOnlyUsageStatsService(fake);
+
+  const results = [];
+  for (let index = 0; index < 8; index += 1) {
+    results.push(await wrapped.getSnapshot({ range: "7d" }));
+  }
+  // 60s 窗口内最多 6 次真实读；第 7 次起回放最近一次成功值（引用相同）。
+  assert.equal(underlyingCalls, 6);
+  assert.strictEqual(results[6], results[5]);
+  assert.strictEqual(results[7], results[5]);
+});
+
+test("usage-stats rate limited reads without any successful snapshot fail with a clear error", async () => {
+  const fake = createFakeUsageStatsService();
+  fake.getSnapshot = async () => {
+    throw new Error("vendor monitor down");
+  };
+  const wrapped = createReadOnlyUsageStatsService(fake);
+
+  for (let index = 0; index < 6; index += 1) {
+    await assert.rejects(wrapped.getSnapshot({ range: "7d" }), /vendor monitor down/);
+  }
+  // 连一次成功快照都没有时不能回放假数据：抛明确的限频错误。
+  await assert.rejects(
+    wrapped.getSnapshot({ range: "7d" }),
+    /usage-stats\.getSnapshot is rate limited on the remote bridge/,
+  );
+});
+
+test("usage-stats wrapper strips invalidateBalanceCache from entitlement requests", async () => {
+  const fake = createFakeUsageStatsService();
+  const seen: Array<Record<string, unknown> | undefined> = [];
+  fake.getEntitlementSnapshot = async (request) => {
+    seen.push(request as Record<string, unknown> | undefined);
+    return { authenticated: true } as never;
+  };
+  const wrapped = createReadOnlyUsageStatsService(fake);
+
+  await wrapped.getEntitlementSnapshot({ invalidateBalanceCache: true, includeSubscription: true });
+  const clean = { includeSubscription: true };
+  await wrapped.getEntitlementSnapshot(clean);
+
+  // 击穿缓存的旗标剥掉；其余请求字段保留；无旗标请求原引用直通（不无辜拷贝）。
+  assert.equal(seen[0]?.invalidateBalanceCache, undefined);
+  assert.equal(seen[0]?.includeSubscription, true);
+  assert.strictEqual(seen[1], clean);
+});
+
+test("subscription client-config reads drop forceRefresh before reaching the device service", async () => {
+  const fake = createFakeCodingPlanSubscriptionService();
+  const seen: Array<{ forceRefresh?: boolean } | undefined> = [];
+  fake.getOffPeakClientConfig = async (options) => {
+    seen.push(options);
+    return { enabled: true, modelSelectionView: { revision: 1, providers: [] } };
+  };
+  fake.getDynamicWorkflowClientConfig = async (options) => {
+    seen.push(options);
+    return { mode: "disabled", enabled: false, source: "default" };
+  };
+  const wrapped = createReadOnlyCodingPlanSubscriptionService(fake);
+
+  const cleanOptions = { forceRefresh: false };
+  await wrapped.getOffPeakClientConfig({ forceRefresh: true });
+  await wrapped.getDynamicWorkflowClientConfig({ forceRefresh: true });
+  await wrapped.getDynamicWorkflowClientConfig(cleanOptions);
+
+  assert.equal(seen[0]?.forceRefresh, undefined);
+  assert.equal(seen[1]?.forceRefresh, undefined);
+  assert.strictEqual(seen[2], cleanOptions);
+});
+
+test("subscription vendor reads are rate limited while the constant strategy read stays unlimited", async () => {
+  const fake = createFakeCodingPlanSubscriptionService();
+  let previewCalls = 0;
+  let strategyCalls = 0;
+  fake.preview = async () => {
+    previewCalls += 1;
+    return { productId: "p1", bizId: "b1" };
+  };
+  fake.getModelContextBudgetStrategy = async () => {
+    strategyCalls += 1;
+    return "preflight-v1";
+  };
+  const wrapped = createReadOnlyCodingPlanSubscriptionService(fake);
+
+  const previews = [];
+  for (let index = 0; index < 8; index += 1) {
+    previews.push(await wrapped.preview(null as never));
+  }
+  // getModelContextBudgetStrategy 是固定常量（不打网络/供应商），不进限频窗口。
+  for (let index = 0; index < 10; index += 1) {
+    await wrapped.getModelContextBudgetStrategy();
+  }
+  assert.equal(previewCalls, 6);
+  assert.strictEqual(previews[6], previews[5]);
+  assert.equal(strategyCalls, 10);
+});
+
+test("subscription offpeak replay after rate limit stays credential-redacted", async () => {
+  const fake = createFakeCodingPlanSubscriptionService();
+  const wrapped = createReadOnlyCodingPlanSubscriptionService(fake);
+
+  const configs = [];
+  for (let index = 0; index < 8; index += 1) {
+    configs.push(await wrapped.getOffPeakClientConfig());
+  }
+  assert.equal(
+    fake.calls.filter((name) => name === "getOffPeakClientConfig").length,
+    6,
+    "7th+ calls replay the 6th snapshot instead of hitting the device service",
+  );
+  // 回放缓存存的是包装层返回值：限频重放的 offpeak 配置同样剥掉 apiKey/headers。
+  const replayed = configs[7]!;
+  const provider = replayed.modelSelectionView.providers[0] as unknown as {
+    config: { access?: Record<string, unknown>; api?: Record<string, unknown> };
+  };
+  assert.equal(provider.config.access?.apiKey, undefined);
+  assert.equal(provider.config.api?.headers, undefined);
+});
+
+// ── 连接资源生命周期：window-controller attachment 随 teardown 收口（两分支）──
+
+test("bridge connection resources dispose attachments and scopes on teardown in both connection branches", async () => {
+  // 分支形态一（有 current connection 的 teardown）：注册期填入 2 个 attachment +
+  // 1 个 agent scope，disposeAll 全部收口；单个 dispose 抛错不阻塞其余成员。
+  const resources = createRemoteBridgeConnectionResources();
+  const disposed: string[] = [];
+  resources.windowControllerAttachments.push(
+    { dispose: () => void disposed.push("attachment-1") },
+    {
+      dispose: () => {
+        throw new Error("dispose boom");
+      },
+    },
+    { dispose: () => void disposed.push("attachment-3") },
+  );
+  resources.agentScopes.push({ dispose: async () => void disposed.push("scope-1") });
+
+  await resources.disposeAll();
+  assert.deepEqual(disposed, ["scope-1", "attachment-1", "attachment-3"]);
+
+  // 分支形态二（无 current connection：连接从未建立或已收口后的重复 teardown）：
+  // 簿本已清空，幂等收口不抛错、不重复 dispose。
+  await resources.disposeAll();
+  assert.equal(disposed.length, 3);
 });
 
 // ── 注册结构：brand、结构化裁决、raw 直注册 fail ────────────────────────────
