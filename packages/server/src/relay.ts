@@ -237,6 +237,8 @@ export interface RelayServerOptions {
   enrollToken?: string;
   /** 网页 lite token（ZCODE_SERVER_AUTH_TOKEN）；缺失时不设 lite token 门（生产由 Authelia 前置）。 */
   authToken?: string;
+  /** 信任 forward_auth 注入的 Remote-User 头（ZCODE_RELAY_TRUST_AUTHELIA=1）：浏览器路径过门即通行。 */
+  trustAuthelia?: boolean;
   staticRoot?: string;
   spaFallback?: boolean;
   /** K2 实验用白名单覆盖；默认 DEFAULT_RELAY_DEVICE_SERVICE_WHITELIST。 */
@@ -401,14 +403,19 @@ export function createRelayServer(port = 3031, options: RelayServerOptions = {})
   const authToken = options.authToken?.trim();
 
   // 偏离 a)：lite token 门 + /ws/host、/api/rpc-host-capability 的 carve-out。
-  if (authToken) {
+  // trustAuthelia 时浏览器路径额外接受 forward_auth 注入的 Remote-User 头——过门
+  // 即通行，无需任何 ?token= 激活链接。伪造不可行：该头只在过门路径上由 Caddy
+  // copy_headers 覆盖注入；桥路径不走 forward_auth，其鉴权只认 Bearer，不看此头。
+  const autheliaTrusted = options.trustAuthelia === true;
+  if (authToken || autheliaTrusted) {
     app.use("*", async (c, next) => {
       const pathname = new URL(c.req.url).pathname;
-      if (
+      const passesLiteGate =
         isEnrollTokenPath(pathname) ||
         !isTokenProtectedPath(pathname) ||
-        hasValidLiteToken(c, authToken)
-      ) {
+        (authToken ? hasValidLiteToken(c, authToken) : false) ||
+        (autheliaTrusted && !isEnrollTokenPath(pathname) && Boolean(c.req.header("Remote-User")?.trim()));
+      if (passesLiteGate) {
         await next();
         return;
       }

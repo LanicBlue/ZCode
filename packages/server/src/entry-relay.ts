@@ -19,12 +19,14 @@ async function main(): Promise<void> {
   const staticRoot = readTrimmedEnv("ZCODE_WEB_STATIC_ROOT");
   const authToken = readTrimmedEnv("ZCODE_SERVER_AUTH_TOKEN");
   const enrollToken = readTrimmedEnv("ZCODE_REMOTE_ENROLL_TOKEN");
+  const trustAuthelia = readTrimmedEnv("ZCODE_RELAY_TRUST_AUTHELIA") === "1";
 
   createRelayServer(port, {
     ...(host ? { host } : {}),
     ...(staticRoot ? { staticRoot, spaFallback: true } : {}),
     ...(authToken ? { authToken } : {}),
     ...(enrollToken ? { enrollToken } : {}),
+    ...(trustAuthelia ? { trustAuthelia } : {}),
   });
 }
 
