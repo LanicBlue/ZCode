@@ -70,3 +70,5 @@ packages/desktop/.e2e-cache/
 packages/desktop/.e2e-network-capture/
 .zcode-runtime/
 .feed-token
+.remote-enroll-token
+.remote-lite-token
